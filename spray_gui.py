@@ -453,11 +453,13 @@ class SprayApp:
         if not replay_dir or not pids:
             return
         before = set(glob.glob(os.path.join(replay_dir, "*.mp4")))
-        self.status_var.set("Clip in 3 s…")
+        buf_after = getattr(self, "clip_after_var", None)
+        delay_s = buf_after.get() if buf_after else 3.0
+        self.status_var.set(f"Clip in {delay_s:g} s…")
 
         def _delayed_save():
-            # Wait so GSR captures 3 s of post-spray footage before saving.
-            time.sleep(3.0)
+            buf_after = getattr(self, "clip_after_var", None)
+            time.sleep(buf_after.get() if buf_after else 3.0)
             sig_time = time.time()
             for pid in pids:
                 try:
@@ -568,12 +570,16 @@ class SprayApp:
         """
         clip_dur  = self._clip_duration
         spray_dur = max(0.1, self._clip_spray_dur)
-        poll_lag  = 3.5          # 3.0 s intentional delay + up to 0.5 s poll cycle
+        buf_before = getattr(self, "clip_before_var", None)
+        buf_after  = getattr(self, "clip_after_var",  None)
+        before = buf_before.get() if buf_before else 3.0
+        after  = buf_after.get()  if buf_after  else 3.0
+        poll_lag = after + 0.5   # intentional delay + up to 0.5 s poll cycle
 
         spray_end   = clip_dur - poll_lag
         spray_start = spray_end - spray_dur
-        ss = max(0.0, spray_start - 3.0)   # 3 s before spray
-        to = min(clip_dur, spray_end + 3.0) # 3 s after spray
+        ss = max(0.0, spray_start - before)
+        to = min(clip_dur, spray_end + after)
         return ss, to
 
     def _clip_finish_load(self, clip_path):
@@ -1015,7 +1021,31 @@ class SprayApp:
         self.bullet_pct_label = tk.Label(lf2, text="clip gate: ≥40% bullets",
                                          bg="#1e1e1e", fg="#555555",
                                          font=("monospace", 8))
-        self.bullet_pct_label.grid(row=7, column=0, pady=(0, 5))
+        self.bullet_pct_label.grid(row=7, column=0, pady=(0, 2))
+
+        self.clip_before_var = tk.DoubleVar(value=3.0)
+        tk.Scale(lf2, variable=self.clip_before_var, from_=0, to=10, resolution=0.5,
+                 orient=tk.HORIZONTAL, bg="#1e1e1e", fg="#d4d4d4",
+                 troughcolor="#3c3c3c", highlightbackground="#1e1e1e",
+                 showvalue=False, length=190,
+                 command=lambda _: self._on_clip_buf_change()).grid(
+            row=8, column=0, padx=4, pady=2)
+        self.clip_before_label = tk.Label(lf2, text="clip: 3.0 s before spray",
+                                          bg="#1e1e1e", fg="#555555",
+                                          font=("monospace", 8))
+        self.clip_before_label.grid(row=9, column=0, pady=(0, 2))
+
+        self.clip_after_var = tk.DoubleVar(value=3.0)
+        tk.Scale(lf2, variable=self.clip_after_var, from_=0, to=10, resolution=0.5,
+                 orient=tk.HORIZONTAL, bg="#1e1e1e", fg="#d4d4d4",
+                 troughcolor="#3c3c3c", highlightbackground="#1e1e1e",
+                 showvalue=False, length=190,
+                 command=lambda _: self._on_clip_buf_change()).grid(
+            row=10, column=0, padx=4, pady=2)
+        self.clip_after_label = tk.Label(lf2, text="clip: 3.0 s after spray",
+                                         bg="#1e1e1e", fg="#555555",
+                                         font=("monospace", 8))
+        self.clip_after_label.grid(row=11, column=0, pady=(0, 5))
 
         # --- Weapon ---
         lf3 = ttk.LabelFrame(parent, text="Weapon")
@@ -1306,6 +1336,14 @@ class SprayApp:
             pct = int(s["clip_bullet_pct"])
             self.bullet_pct_var.set(pct)
             self.bullet_pct_label.config(text=f"clip gate: ≥{pct}% bullets")
+        if "clip_before_s" in s:
+            v = float(s["clip_before_s"])
+            self.clip_before_var.set(v)
+            self.clip_before_label.config(text=f"clip: {v:g} s before spray")
+        if "clip_after_s" in s:
+            v = float(s["clip_after_s"])
+            self.clip_after_var.set(v)
+            self.clip_after_label.config(text=f"clip: {v:g} s after spray")
         # Device (override CLI --device only if no device was passed on the CLI)
         if not self.current_device and s.get("device"):
             saved = s["device"]
@@ -1332,7 +1370,9 @@ class SprayApp:
             "vfocus_enabled":  self.vfocus_var.get(),
             "live_mode":       self.live_mode_var.get(),
             "clip_auto":       self.clip_auto_var.get(),
-            "clip_bullet_pct": self.bullet_pct_var.get(),
+            "clip_bullet_pct":  self.bullet_pct_var.get(),
+            "clip_before_s":    self.clip_before_var.get(),
+            "clip_after_s":     self.clip_after_var.get(),
         }
         try:
             with open(self._settings_path, "w") as f:
@@ -1682,6 +1722,13 @@ class SprayApp:
     def _on_bullet_pct_change(self):
         pct = self.bullet_pct_var.get()
         self.bullet_pct_label.config(text=f"clip gate: ≥{pct}% bullets")
+        self._save_settings()
+
+    def _on_clip_buf_change(self):
+        before = self.clip_before_var.get()
+        after  = self.clip_after_var.get()
+        self.clip_before_label.config(text=f"clip: {before:g} s before spray")
+        self.clip_after_label.config(text=f"clip: {after:g} s after spray")
         self._save_settings()
 
     def _on_detrend_toggle(self):
