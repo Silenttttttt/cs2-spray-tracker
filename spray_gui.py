@@ -1730,7 +1730,7 @@ class SprayApp:
         if any(sp.get("clip") for sp in chain_sprays):
             wep = "▶" + wep
         if len(chain) > 1:
-            wep = f"⛓{len(chain)} " + wep
+            wep = f"x{len(chain)} " + wep
         self.history_tree.insert("", "end", iid=iid,
                                  values=(wep, f"{total_dur_ms}", f"{total_smp}", f"{int(total_ny):+d}"))
         self.history_tree.see(iid)
@@ -2297,7 +2297,7 @@ class SprayApp:
         fire_t, fire_x, fire_y = self._bullet_positions(t, x, y, wdata)
         n_shots = len(fire_t)
 
-        title_prefix = (f"⛓{len(chain_sprays)}-spray chain" if is_chain
+        title_prefix = (f"[x{len(chain_sprays)} chain]" if is_chain
                         else sel["_file"])
         fig.suptitle(
             f"{title_prefix}   {combined_dur*1000:.0f} ms   {combined_smp} samples"
