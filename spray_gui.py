@@ -642,6 +642,11 @@ class SprayApp:
             self._clip_paused = True
             self._clip_pp_var.set("▶")
         self._clip_stop()
+        # Drop the current PhotoImage before resizing the container.
+        # A label holding a large image doesn't shrink with the container —
+        # it overflows downward and hides the control bar.
+        self._clip_vid_label.configure(image="")
+        self._clip_photo = None
 
         if self._clip_fullscreen:
             self._clip_container.place(relx=0, rely=0, anchor="nw",
