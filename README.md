@@ -20,6 +20,10 @@ It is a **practice journal for your hand**, not a tool for your game client. The
 
 ---
 
+![CS2 Spray Tracker screenshot](docs/screenshot.png)
+
+---
+
 ## Install
 
 ### Dependencies (Manjaro / Arch)
@@ -129,6 +133,8 @@ A new entry appears in the history list automatically.
 
 **Clip gate slider** (0–100 %): only save a clip if you fired at least this percentage of the magazine. Default 40 %. Set to 0 % to clip every spray; set to 100 % to only clip full sprays.
 
+**Clip before / after sliders** (0–10 s): how many seconds of footage to include before the first bullet and after the last bullet. Both default to 3 s. The "after" value also sets the delay before the GSR save is triggered, ensuring the buffer actually contains that much post-spray footage.
+
 ### Spray history
 
 Table of all recorded sprays (most recent at top). Click any row to load it into the plots and the clip player. Columns: weapon, duration (ms), sample count, net-Y (total vertical pull in mouse counts).
@@ -146,19 +152,22 @@ The bottom-right panel is an embedded video player. It loads the first frame aut
 | Button | Action |
 |--------|--------|
 | ▶ / ⏸ | Play / pause |
+| 🔇 / 🔊 | Mute / unmute audio (default: muted) |
+| ⤢ / ⤡ | Expand to full canvas / restore corner |
+| 💾 | Export the trimmed clip as a standalone `.mp4` |
 | `0.1×` `0.25×` `0.5×` `1.0×` | Playback speed |
 
-The time display (`0:05 / 0:09`) shows position and duration of the **trimmed** window, not the raw clip.
+The time display (`0:05 / 0:09`) shows position and duration of the **trimmed** window, not the raw clip. Video and audio are wall-clock synced — frames are dropped or held to match elapsed real time, so playback never drifts.
 
 ### Trim logic
 
 GSR saves the last N seconds of replay when triggered. Because most of that is idle time before the spray, the player automatically trims the clip to:
 
 ```
-[ 2 s before spray ] → [ spray ] → [ 1 s after spray ]
+[ before buffer ] → [ spray ] → [ after buffer ]
 ```
 
-This is computed from the spray's recorded duration and the approximate delay between spray end and the GSR signal.
+Both buffers default to **3 seconds** and are adjustable via sliders in the sidebar (0–10 s, 0.5 s steps). The before/after values are persisted in `settings.json`. The after buffer also controls how long the tracker waits before triggering the GSR save, so the clip always contains the full post-spray window you configured.
 
 ---
 
