@@ -25,6 +25,7 @@ import json
 import os
 import queue
 import select
+import subprocess
 import sys
 import threading
 import time
@@ -203,7 +204,8 @@ class Recorder(threading.Thread):
 
     MIN_SAMPLES = 5
 
-    def __init__(self, device_path, out_dir, out_queue, min_duration=0.50):
+    def __init__(self, device_path, out_dir, out_queue, min_duration=0.50,
+                 gui_hover_fn=None):
         super().__init__(daemon=True)
         self.device_path = device_path
         self.out_dir = out_dir
@@ -213,6 +215,7 @@ class Recorder(threading.Thread):
         self.live_samples = 0        # count of samples in current spray
         self.weapon = "None"         # set by GUI; captured at LMB-down
         self.min_duration = min_duration
+        self.gui_hover_fn = gui_hover_fn  # callable → True when mouse is over GUI
         self._live_lock = threading.Lock()
         self._live_active = False
         self._live_t0 = 0.0
@@ -267,18 +270,22 @@ class Recorder(threading.Thread):
                 for ev in events:
                     if ev.type == ecodes.EV_KEY and ev.code == ecodes.BTN_LEFT:
                         if ev.value == 1 and not recording:
-                            recording = True
-                            t0 = ev.timestamp()
-                            samples = []
-                            pend_dx = pend_dy = 0
-                            spray_weapon = self.weapon  # capture at press time
-                            self.status = "recording"
-                            self.live_samples = 0
-                            with self._live_lock:
-                                self._live_active = True
-                                self._live_t0 = t0
-                                self._live_weapon = spray_weapon
-                                self._live_ref = samples
+                            # Skip if click is inside the GUI window
+                            if self.gui_hover_fn and self.gui_hover_fn():
+                                pass
+                            else:
+                                recording = True
+                                t0 = ev.timestamp()
+                                samples = []
+                                pend_dx = pend_dy = 0
+                                spray_weapon = self.weapon
+                                self.status = "recording"
+                                self.live_samples = 0
+                                with self._live_lock:
+                                    self._live_active = True
+                                    self._live_t0 = t0
+                                    self._live_weapon = spray_weapon
+                                    self._live_ref = samples
                         elif ev.value == 0 and recording:
                             recording = False
                             self.status = "idle"
@@ -357,6 +364,23 @@ class SprayApp:
         self._live_prev_count = 0    # sample count at last live render
         self._live_poll_running = False
         self._live_pattern_cache = None  # (cache_key, it, ix, iy)
+        self._clip_notify_queue = queue.Queue()
+
+        # PIL-based clip player state
+        self._clip_paused    = True
+        self._clip_speed     = 1.0
+        self._clip_fps       = 30.0
+        self._clip_duration  = 0.0
+        self._clip_frame_num = 0
+        self._clip_tick_id   = None
+        self._clip_ffmpeg    = None          # decode subprocess
+        self._clip_stop_evt  = threading.Event()
+        self._frame_queue    = queue.Queue(maxsize=300)
+        self._clip_photo     = None          # keep PhotoImage reference
+        self._clip_vid_w     = 1
+        self._clip_vid_h     = 1
+        self._current_clip_path = None
+        self._mouse_in_gui = False  # updated by _poll_hover every 50 ms
 
         root.title("CS2 Spray Tracker")
         root.configure(bg="#1e1e1e")
@@ -364,6 +388,404 @@ class SprayApp:
         self._apply_settings(self._load_settings())
         self._load_existing_sprays()
         self._schedule_poll()
+        self._poll_hover()
+
+    # ------------------------------------------------------------------
+    # Clip helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @staticmethod
+    def _find_gsr_replay_dir():
+        """Parse the live gsr process cmdline for its -o output directory."""
+        try:
+            pids = subprocess.check_output(
+                ["pgrep", "-f", "gpu-screen-recorder"], text=True).split()
+            for pid in pids:
+                try:
+                    with open(f"/proc/{pid.strip()}/cmdline", "rb") as fh:
+                        args = [a.decode("utf-8", errors="replace")
+                                for a in fh.read().split(b"\x00")]
+                    if "-o" in args:
+                        idx = args.index("-o")
+                        path = args[idx + 1]
+                        if os.path.isdir(path):
+                            return path, [int(p) for p in pids]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Fallback: config file
+        cfg = os.path.expanduser(
+            "~/.var/app/com.dec05eba.gpu_screen_recorder/config/gpu-screen-recorder/config")
+        try:
+            with open(cfg) as fh:
+                for line in fh:
+                    if line.startswith("replay.save_directory "):
+                        d = line.split(" ", 1)[1].strip()
+                        if os.path.isdir(d):
+                            return d, []
+        except Exception:
+            pass
+        return None, []
+
+    def _bullet_count_estimate(self, spray):
+        """How many bullets were likely fired (RPM × duration, capped at mag)."""
+        wdata = WEAPON_DATA.get(spray.get("weapon", "None"))
+        if not wdata:
+            return 0, 0
+        mag = wdata["mag"]
+        rpm = wdata["rpm"]
+        dur = spray.get("duration", 0)
+        n = min(mag, int(dur * rpm / 60) + 1)
+        return n, mag
+
+    def _maybe_save_clip(self, spray):
+        import glob, signal as _sig
+        n_shots, mag = self._bullet_count_estimate(spray)
+        gate = getattr(self, "bullet_pct_var", None)
+        threshold = (gate.get() / 100.0) if gate else 0.4
+        if mag == 0 or n_shots < threshold * mag:
+            return
+        replay_dir, pids = self._find_gsr_replay_dir()
+        if not replay_dir or not pids:
+            return
+        # Snapshot before signal so we don't miss a fast save
+        before = set(glob.glob(os.path.join(replay_dir, "*.mp4")))
+        sig_time = time.time()
+        for pid in pids:
+            try:
+                os.kill(pid, _sig.SIGRTMIN + 1)
+            except Exception:
+                pass
+        # Kill gsr-notify quickly so the HUD doesn't flash on screen
+        def _suppress_notify():
+            time.sleep(0.25)
+            try:
+                subprocess.run(["pkill", "-f", "gsr-notify"],
+                               capture_output=True)
+            except Exception:
+                pass
+        threading.Thread(target=_suppress_notify, daemon=True).start()
+        self.status_var.set("Saving clip…")
+        threading.Thread(
+            target=self._clip_worker,
+            args=(spray, replay_dir, before, sig_time),
+            daemon=True,
+        ).start()
+
+    def _clip_worker(self, spray, replay_dir, before, sig_time):
+        import glob, shutil
+        deadline = time.time() + 15
+        new_file = None
+        while time.time() < deadline:
+            time.sleep(0.5)
+            after = set(glob.glob(os.path.join(replay_dir, "*.mp4")))
+            candidates = {f for f in after - before
+                          if os.path.getmtime(f) >= sig_time - 1.0}
+            if candidates:
+                new_file = max(candidates, key=os.path.getmtime)
+                break
+        if not new_file:
+            return
+        clips_dir = os.path.join(self.out_dir, "clips")
+        os.makedirs(clips_dir, exist_ok=True)
+        clip_name = f"clip_{os.path.splitext(spray['_file'])[0]}.mp4"
+        dest = os.path.join(clips_dir, clip_name)
+        try:
+            shutil.move(new_file, dest)
+        except Exception:
+            return
+        # Persist in spray JSON
+        spray_path = os.path.join(self.out_dir, spray["_file"])
+        try:
+            with open(spray_path) as f:
+                data = json.load(f)
+            data["clip"] = clip_name
+            with open(spray_path, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+        spray["clip"] = clip_name
+        self._clip_notify_queue.put(spray["_file"])
+
+    # ------------------------------------------------------------------
+    # Clip player (PIL + ffmpeg pipe)
+    # ------------------------------------------------------------------
+
+    def _play_clip(self):
+        """Sidebar button — toggle play/pause for current clip."""
+        if not self.sprays:
+            return
+        idx = max(0, min(self.selected_idx, len(self.sprays) - 1))
+        clip_name = self.sprays[idx].get("clip", "")
+        if not clip_name:
+            return
+        clip_path = os.path.join(self.out_dir, "clips", clip_name)
+        if not os.path.exists(clip_path):
+            return
+        spray_dur = self.sprays[idx].get("duration", 0)
+        if self._current_clip_path != clip_path:
+            self._clip_load(clip_path, spray_duration=spray_dur)
+        else:
+            self._clip_toggle_play()
+
+    def _clip_load(self, clip_path, spray_duration=0):
+        """Probe the clip, show first frame, reset player."""
+        self._clip_stop()
+        self._current_clip_path = clip_path
+        self._clip_spray_dur = spray_duration
+
+        def _probe():
+            try:
+                result = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-print_format", "json",
+                     "-show_streams", "-show_format", clip_path],
+                    capture_output=True, text=True)
+                info = json.loads(result.stdout)
+                vs = next((s for s in info.get("streams", [])
+                           if s.get("codec_type") == "video"), {})
+                fps_raw = vs.get("r_frame_rate", "30/1")
+                a, b = fps_raw.split("/")
+                fps = float(a) / max(1, float(b))
+                dur = float(vs.get("duration")
+                            or info.get("format", {}).get("duration", 0))
+            except Exception:
+                fps, dur = 30.0, 0.0
+            self._clip_fps      = max(1, fps)
+            self._clip_duration = dur
+            self.root.after(0, lambda: self._clip_finish_load(clip_path))
+
+        threading.Thread(target=_probe, daemon=True).start()
+
+    def _clip_trim_window(self):
+        """Return (ss, to) trim points in seconds based on spray duration.
+
+        GSR saves the last N seconds ending right when we sent the signal,
+        which is at most ~0.5s after the spray ended.  We want:
+          2 s before spray start … spray end … 1 s after (capped by clip).
+        """
+        clip_dur  = self._clip_duration
+        spray_dur = max(0.1, self._clip_spray_dur)
+        poll_lag  = 0.5          # max seconds between spray-end and signal
+
+        spray_end   = clip_dur - poll_lag
+        spray_start = spray_end - spray_dur
+        ss = max(0.0, spray_start - 2.0)   # 2 s before spray
+        to = min(clip_dur, spray_end + 1.0) # 1 s after spray
+        return ss, to
+
+    def _clip_finish_load(self, clip_path):
+        """Called in main thread after probe — compute trim, show thumbnail."""
+        self.root.update()
+        w = self._clip_vid_label.winfo_width()
+        h = self._clip_vid_label.winfo_height()
+        if w < 4:
+            w, h = 300, 180
+        self._clip_vid_w = w
+        self._clip_vid_h = h
+
+        ss, to = self._clip_trim_window()
+        self._clip_ss = ss
+        self._clip_to = to
+        trimmed_dur = to - ss
+
+        def _fmt(s):
+            s = max(0, int(s))
+            return f"{s // 60}:{s % 60:02d}"
+        self._clip_time_var.set(f"0:00 / {_fmt(trimmed_dur)}")
+
+        def _thumb():
+            try:
+                from PIL import Image, ImageTk as _ITk
+                proc = subprocess.Popen(
+                    ["ffmpeg", "-ss", str(ss), "-i", clip_path,
+                     "-frames:v", "1",
+                     "-vf", f"scale={w}:{h}",
+                     "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                data = proc.stdout.read(w * h * 3)
+                proc.wait()
+                if len(data) == w * h * 3:
+                    img = Image.frombytes("RGB", (w, h), data)
+                    photo = _ITk.PhotoImage(img)
+                    self.root.after(0, lambda: self._clip_show_photo(photo))
+            except Exception:
+                pass
+
+        threading.Thread(target=_thumb, daemon=True).start()
+        self._update_clip_btn()
+
+    def _clip_show_photo(self, photo):
+        self._clip_photo = photo   # keep reference — PhotoImage gets GC'd otherwise
+        self._clip_vid_label.configure(image=photo, text="")
+        self._clip_pp_var.set("▶")
+
+    def _clip_toggle_play(self):
+        if not self._current_clip_path:
+            return
+        if self._clip_paused:
+            self._clip_paused = False
+            self._clip_pp_var.set("⏸")
+            if not hasattr(self, "_clip_decode_started") or not self._clip_decode_started:
+                self._clip_start_decode()
+            self._clip_tick()
+        else:
+            self._clip_paused = True
+            self._clip_pp_var.set("▶")
+
+    def _clip_start_decode(self):
+        self._clip_decode_started = True
+        self._clip_stop_evt.clear()
+        w, h = self._clip_vid_w, self._clip_vid_h
+        path = self._current_clip_path
+
+        # Drain stale frames
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except Exception:
+                break
+
+        ss = getattr(self, "_clip_ss", 0.0)
+        to = getattr(self, "_clip_to", None)
+        cmd = ["ffmpeg", "-ss", str(ss)]
+        if to is not None:
+            cmd += ["-to", str(to)]
+        cmd += ["-i", path,
+                "-vf", f"scale={w}:{h}",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+        self._clip_ffmpeg = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        frame_size = w * h * 3
+        stop = self._clip_stop_evt
+        q    = self._frame_queue
+        proc = self._clip_ffmpeg
+
+        def _reader():
+            try:
+                from PIL import Image
+                while not stop.is_set():
+                    data = proc.stdout.read(frame_size)
+                    if len(data) < frame_size:
+                        q.put(None)   # end-of-stream sentinel
+                        break
+                    img = Image.frombytes("RGB", (w, h), data)
+                    while not stop.is_set():
+                        try:
+                            q.put(img, timeout=0.1)
+                            break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+    def _clip_tick(self):
+        if self._clip_paused:
+            return
+        try:
+            item = self._frame_queue.get_nowait()
+        except Exception:
+            self._clip_tick_id = self.root.after(16, self._clip_tick)
+            return
+
+        if item is None:
+            # End of stream — loop
+            self._clip_stop_evt.set()
+            if self._clip_ffmpeg:
+                try:
+                    self._clip_ffmpeg.kill()
+                except Exception:
+                    pass
+            self._clip_ffmpeg = None
+            self._clip_frame_num = 0
+            self._clip_decode_started = False
+            self._clip_start_decode()
+            self._clip_tick_id = self.root.after(16, self._clip_tick)
+            return
+
+        from PIL import ImageTk as _ITk
+        photo = _ITk.PhotoImage(item)
+        self._clip_photo = photo
+        self._clip_vid_label.configure(image=photo, text="")
+
+        self._clip_frame_num += 1
+        pos = self._clip_frame_num / max(1, self._clip_fps)
+
+        def _fmt(s):
+            s = max(0, int(s))
+            return f"{s // 60}:{s % 60:02d}"
+        self._clip_time_var.set(f"{_fmt(pos)} / {_fmt(self._clip_duration)}")
+
+        interval = max(1, int(1000.0 / (self._clip_fps * self._clip_speed)))
+        self._clip_tick_id = self.root.after(interval, self._clip_tick)
+
+    def _clip_set_speed(self, s):
+        self._clip_speed = s
+        # Highlight active speed button
+        for spd, btn in self._clip_spd_btns.items():
+            btn.config(style="Accent.TButton" if spd == s else "TButton")
+
+    def _clip_stop(self):
+        """Stop playback, kill ffmpeg, reset state."""
+        self._clip_paused = True
+        self._clip_stop_evt.set()
+        if self._clip_tick_id:
+            try:
+                self.root.after_cancel(self._clip_tick_id)
+            except Exception:
+                pass
+            self._clip_tick_id = None
+        if self._clip_ffmpeg:
+            try:
+                self._clip_ffmpeg.kill()
+            except Exception:
+                pass
+            self._clip_ffmpeg = None
+        # Drain queue
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except Exception:
+                break
+        self._clip_frame_num = 0
+        self._clip_decode_started = False
+        self._clip_pp_var.set("▶")
+
+    def _on_close(self):
+        self._clip_stop()
+        self.root.destroy()
+
+    def _update_clip_btn(self):
+        if not hasattr(self, "_clip_play_btn"):
+            return
+        if not self.sprays:
+            self._clip_play_btn.config(state="disabled", text="▶  No clip")
+            self._clip_set_label("no clip for this spray")
+            return
+        idx = max(0, min(self.selected_idx, len(self.sprays) - 1))
+        clip_name = self.sprays[idx].get("clip", "")
+        has_clip = bool(clip_name)
+        self._clip_play_btn.config(
+            state="normal" if has_clip else "disabled",
+            text="▶  Play clip" if has_clip else "▶  No clip",
+        )
+        if has_clip:
+            clip_path = os.path.join(self.out_dir, "clips", clip_name)
+            if os.path.exists(clip_path) and clip_path != self._current_clip_path:
+                spray_dur = self.sprays[idx].get("duration", 0)
+                self._clip_load(clip_path, spray_duration=spray_dur)
+        else:
+            self._clip_stop()
+            self._clip_set_label("no clip for this spray")
+            self._current_clip_path = None
+
+    def _clip_set_label(self, text):
+        if hasattr(self, "_clip_vid_label"):
+            self._clip_vid_label.configure(image="", text=text)
 
     # ------------------------------------------------------------------
     # UI build
@@ -381,6 +803,12 @@ class SprayApp:
         style.configure("TLabel", background="#1e1e1e", foreground="#d4d4d4")
         style.configure("TLabelframe", background="#1e1e1e", foreground="#9cdcfe")
         style.configure("TLabelframe.Label", background="#1e1e1e", foreground="#9cdcfe")
+        style.configure("TNotebook", background="#1e1e1e", borderwidth=0)
+        style.configure("TNotebook.Tab", background="#2d2d2d", foreground="#9d9d9d",
+                        padding=[10, 4])
+        style.map("TNotebook.Tab",
+                  background=[("selected", "#1e1e1e")],
+                  foreground=[("selected", "#569cd6")])
         style.configure("TCombobox", fieldbackground="#2d2d2d", foreground="#d4d4d4",
                         selectbackground="#094771")
         style.configure("Treeview", background="#252526", foreground="#cccccc",
@@ -425,8 +853,11 @@ class SprayApp:
         pane.add(plot_frame, minsize=600)
 
         self._build_sidebar(sidebar)
+
         self._build_plot_area(plot_frame)
         self._build_status_bar()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_sidebar(self, parent):
         tk = self.tk
@@ -477,7 +908,25 @@ class SprayApp:
         ttk.Checkbutton(lf2, text="Live view  (update while spraying)",
                         variable=self.live_mode_var,
                         command=self._on_live_toggle).grid(
-            row=4, column=0, sticky="w", padx=8, pady=(0, 5))
+            row=4, column=0, sticky="w", padx=8, pady=(0, 2))
+
+        self.clip_auto_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(lf2, text="Auto-clip  (via gsr)",
+                        variable=self.clip_auto_var,
+                        command=self._save_settings).grid(
+            row=5, column=0, sticky="w", padx=8, pady=(0, 2))
+
+        self.bullet_pct_var = tk.IntVar(value=40)
+        tk.Scale(lf2, variable=self.bullet_pct_var, from_=0, to=100, resolution=5,
+                 orient=tk.HORIZONTAL, bg="#1e1e1e", fg="#d4d4d4",
+                 troughcolor="#3c3c3c", highlightbackground="#1e1e1e",
+                 showvalue=False, length=190,
+                 command=lambda _: self._on_bullet_pct_change()).grid(
+            row=6, column=0, padx=4, pady=2)
+        self.bullet_pct_label = tk.Label(lf2, text="clip gate: ≥40% bullets",
+                                         bg="#1e1e1e", fg="#555555",
+                                         font=("monospace", 8))
+        self.bullet_pct_label.grid(row=7, column=0, pady=(0, 5))
 
         # --- Weapon ---
         lf3 = ttk.LabelFrame(parent, text="Weapon")
@@ -601,6 +1050,11 @@ class SprayApp:
         self.history_tree.configure(yscrollcommand=sb.set)
         self.history_tree.bind("<<TreeviewSelect>>", self._on_history_select)
 
+        self._clip_play_btn = ttk.Button(lf5, text="▶  No clip",
+                                         command=self._play_clip, state="disabled")
+        self._clip_play_btn.grid(row=1, column=0, columnspan=2,
+                                 sticky="ew", padx=6, pady=(4, 6))
+
         # --- Clear buttons ---
         clr_frame = tk.Frame(parent, bg="#1e1e1e")
         clr_frame.grid(row=row, column=0, sticky="ew", padx=6, pady=(2, 8))
@@ -626,7 +1080,7 @@ class SprayApp:
 
         self.ax_traj = self.fig.add_subplot(gs[:, 0])   # left: full height, trajectory
         self.ax_all  = self.fig.add_subplot(gs[0, 1])   # top-right: all sprays
-        self.ax_cum  = self.fig.add_subplot(gs[1, 1])   # bottom-right: cumulative
+        # gs[1, 1] (bottom-right) is left empty — video panel sits there
 
         # Create colorbar ONCE here with a placeholder so ax_traj is only shrunk once
         import matplotlib.cm as cm
@@ -637,7 +1091,7 @@ class SprayApp:
         self._colorbar.ax.tick_params(labelcolor="#9d9d9d", labelsize=7)
         self._colorbar.set_label("time (s)", color="#9d9d9d", fontsize=7)
 
-        for ax in (self.ax_traj, self.ax_all, self.ax_cum):
+        for ax in (self.ax_traj, self.ax_all):
             ax.set_facecolor("#252526")
             ax.tick_params(colors="#9d9d9d", labelsize=7)
             ax.xaxis.label.set_color("#9d9d9d")
@@ -647,10 +1101,54 @@ class SprayApp:
                 spine.set_edgecolor("#3c3c3c")
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
-        self.canvas.get_tk_widget().pack(fill=self.tk.BOTH, expand=True)
+        canvas_tk = self.canvas.get_tk_widget()
+        canvas_tk.pack(fill=self.tk.BOTH, expand=True)
         toolbar = NavigationToolbar2Tk(self.canvas, parent)
         toolbar.update()
         toolbar.configure(bg="#1e1e1e")
+
+        # Video player panel in the bottom-right slot (where ax_cum was)
+        tk  = self.tk
+        ttk = self.ttk
+
+        clip_container = tk.Frame(canvas_tk, bg="#1e1e1e", bd=1, relief=tk.SUNKEN)
+        clip_container.place(relx=1.0, rely=1.0, anchor="se",
+                             relwidth=0.375, relheight=0.46)
+
+        # Video display area — shows PIL frames or "no clip" text
+        self._clip_vid_label = tk.Label(clip_container, bg="black",
+                                        text="no clip for this spray",
+                                        fg="#333333", font=("monospace", 8),
+                                        anchor="center")
+        self._clip_vid_label.pack(fill=tk.BOTH, expand=True)
+
+        # Controls bar
+        ctrl = tk.Frame(clip_container, bg="#252526")
+        ctrl.pack(fill=tk.X, side=tk.BOTTOM)
+
+        row1 = tk.Frame(ctrl, bg="#252526")
+        row1.pack(fill=tk.X, padx=4, pady=(3, 1))
+
+        self._clip_pp_var = tk.StringVar(value="▶")
+        ttk.Button(row1, textvariable=self._clip_pp_var, width=3,
+                   command=self._clip_toggle_play).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._clip_time_var = tk.StringVar(value="0:00 / 0:00")
+        tk.Label(row1, textvariable=self._clip_time_var, bg="#252526",
+                 fg="#9d9d9d", font=("monospace", 8)).pack(side=tk.LEFT)
+
+        row2 = tk.Frame(ctrl, bg="#252526")
+        row2.pack(fill=tk.X, padx=4, pady=(1, 3))
+
+        tk.Label(row2, text="Speed:", bg="#252526", fg="#666666",
+                 font=("monospace", 7)).pack(side=tk.LEFT)
+        self._clip_spd_btns = {}
+        for spd in (0.1, 0.25, 0.5, 1.0):
+            lbl = f"{spd}×"
+            b = ttk.Button(row2, text=lbl, width=5,
+                           command=lambda s=spd: self._clip_set_speed(s))
+            b.pack(side=tk.LEFT, padx=1)
+            self._clip_spd_btns[spd] = b
 
     def _build_status_bar(self):
         tk = self.tk
@@ -698,6 +1196,14 @@ class SprayApp:
         # Live mode toggle
         if "live_mode" in s:
             self.live_mode_var.set(bool(s["live_mode"]))
+        # Auto-clip toggle
+        if "clip_auto" in s:
+            self.clip_auto_var.set(bool(s["clip_auto"]))
+        # Bullet % gate slider
+        if "clip_bullet_pct" in s:
+            pct = int(s["clip_bullet_pct"])
+            self.bullet_pct_var.set(pct)
+            self.bullet_pct_label.config(text=f"clip gate: ≥{pct}% bullets")
         # Device (override CLI --device only if no device was passed on the CLI)
         if not self.current_device and s.get("device"):
             saved = s["device"]
@@ -723,6 +1229,8 @@ class SprayApp:
             "device":          self._selected_device_path(),
             "vfocus_enabled":  self.vfocus_var.get(),
             "live_mode":       self.live_mode_var.get(),
+            "clip_auto":       self.clip_auto_var.get(),
+            "clip_bullet_pct": self.bullet_pct_var.get(),
         }
         try:
             with open(self._settings_path, "w") as f:
@@ -780,7 +1288,8 @@ class SprayApp:
                 self.status_var.set("No device selected — refresh and pick one.")
                 return
             self.recorder = Recorder(path, self.out_dir, self.rec_queue,
-                                     min_duration=self.min_hold_var.get() / 1000.0)
+                                     min_duration=self.min_hold_var.get() / 1000.0,
+                                     gui_hover_fn=lambda: self._mouse_in_gui)
             self.recorder.weapon = self.weapon_var.get()
             self.recorder.start()
             self.rec_btn_text.set("■  Disarm recorder")
@@ -794,6 +1303,20 @@ class SprayApp:
     def _schedule_poll(self):
         self.root.after(self.POLL_MS, self._poll)
 
+    def _poll_hover(self):
+        """Track whether the mouse cursor is inside our window every 50 ms."""
+        try:
+            px = self.root.winfo_pointerx()
+            py = self.root.winfo_pointery()
+            wx = self.root.winfo_rootx()
+            wy = self.root.winfo_rooty()
+            ww = self.root.winfo_width()
+            wh = self.root.winfo_height()
+            self._mouse_in_gui = (wx <= px <= wx + ww and wy <= py <= wy + wh)
+        except Exception:
+            pass
+        self.root.after(50, self._poll_hover)
+
     def _poll(self):
         new_files = []
         while not self.rec_queue.empty():
@@ -803,6 +1326,7 @@ class SprayApp:
             self._live_override = None
             self._live_prev_count = 0
             self._live_pattern_cache = None
+            new_sprays = []
             for f in new_files:
                 try:
                     with open(f) as fh:
@@ -811,11 +1335,31 @@ class SprayApp:
                     if data.get("samples"):
                         self.sprays.append(data)
                         self._add_history_row(len(self.sprays) - 1, data)
+                        new_sprays.append(data)
                 except Exception:
                     pass
             self.selected_idx = len(self.sprays) - 1
             self._sync_history_selection()
             self._refresh_plot()
+            self._update_clip_btn()
+            # Trigger auto-clip for qualifying new sprays
+            if self.clip_auto_var.get():
+                for sp in new_sprays:
+                    self._maybe_save_clip(sp)
+
+        # Drain clip notify queue — update history rows when clips land
+        while not self._clip_notify_queue.empty():
+            fname = self._clip_notify_queue.get_nowait()
+            for i, sp in enumerate(self.sprays):
+                if sp.get("_file") == fname:
+                    iid = str(i)
+                    if self.history_tree.exists(iid):
+                        vals = list(self.history_tree.item(iid, "values"))
+                        if not vals[0].startswith("▶"):
+                            vals[0] = "▶" + vals[0]
+                        self.history_tree.item(iid, values=tuple(vals))
+                    break
+            self._update_clip_btn()
 
         # Update recording indicator
         if self.recorder and self.recorder.is_alive():
@@ -914,6 +1458,8 @@ class SprayApp:
         smp = spray.get("n_samples", 0)
         ny = spray.get("net_dy", 0)
         wep = self._WEP_ABBREV.get(spray.get("weapon", ""), spray.get("weapon", "")[:6])
+        if spray.get("clip"):
+            wep = "▶" + wep
         iid = str(idx)
         if self.history_tree.exists(iid):
             return
@@ -938,6 +1484,7 @@ class SprayApp:
             if wep in WEAPON_DATA:
                 self._select_weapon(wep, refresh=False, retag=False)
             self._refresh_plot()
+            self._update_clip_btn()
 
     def _select_weapon(self, name, refresh=True, retag=True):
         # Save old weapon's sensitivity, load new weapon's
@@ -1028,6 +1575,11 @@ class SprayApp:
         self.min_hold_label.config(text=f"min hold: {ms} ms")
         if self.recorder and self.recorder.is_alive():
             self.recorder.min_duration = ms / 1000.0
+        self._save_settings()
+
+    def _on_bullet_pct_change(self):
+        pct = self.bullet_pct_var.get()
+        self.bullet_pct_label.config(text=f"clip gate: ≥{pct}% bullets")
         self._save_settings()
 
     def _on_detrend_toggle(self):
@@ -1343,9 +1895,8 @@ class SprayApp:
 
         ax_traj = self.ax_traj
         ax_all  = self.ax_all
-        ax_cum  = self.ax_cum
 
-        for ax in (ax_traj, ax_all, ax_cum):
+        for ax in (ax_traj, ax_all):
             ax.cla()
             ax.set_facecolor("#252526")
             ax.tick_params(colors="#9d9d9d", labelsize=7)
@@ -1518,25 +2069,6 @@ class SprayApp:
             ax_all.set_aspect("equal", adjustable="datalim")
             ax_all.margins(0.1)
 
-        # ----------------------------------------------------------------
-        # BOTTOM-RIGHT: cumulative pull vs ideal over time
-        # ----------------------------------------------------------------
-        ax_cum.plot(t, x, label="your H", color="#569cd6", lw=1.5)
-        ax_cum.plot(t, y, label="your V", color="#ce9178", lw=1.5)
-        if wdata:
-            it, ix, iy = pattern_to_counts(wdata, sensitivity, m_yaw,
-                                           max_duration=sel.get("duration"))
-            ax_cum.plot(it, ix, "--", color="#9cdcfe", lw=1.5, alpha=0.7,
-                        label="ideal H")
-            ax_cum.plot(it, iy, "--", color="#ffcc88", lw=1.5, alpha=0.7,
-                        label="ideal V")
-        ax_cum.axhline(0, color="#444", lw=0.5)
-        ax_cum.set_title("Cumulative pull vs ideal", color="#d4d4d4", fontsize=8)
-        ax_cum.set_xlabel("time (s)", fontsize=7)
-        ax_cum.set_ylabel("counts", fontsize=7)
-        ax_cum.legend(fontsize=6, facecolor="#2d2d2d",
-                      edgecolor="#3c3c3c", labelcolor="#d4d4d4",
-                      ncol=2)
         self.canvas.draw_idle()
 
         # Status bar
