@@ -693,10 +693,13 @@ class SprayApp:
             return
         clip_ss = getattr(self, "_clip_ss", 0.0)
         clip_to = getattr(self, "_clip_to", None)
-        # Seek to the right position in the file
+        # Target position in the file for the current frame
         audio_ss = clip_ss + frame_offset / max(1.0, self._clip_fps)
-        # Compensate for ffplay startup latency (~150 ms) by starting slightly early
-        audio_ss = max(clip_ss, audio_ss - 0.15)
+        # Seek 0.15 s BEFORE the target so audio is at the right position when
+        # video starts advancing (video is delayed +0.3 s, startup ≈ 0.15 s,
+        # net: audio position matches video position at t = play_start + 0.3 s).
+        # Clamp to 0.0 (not clip_ss) so we can seek before the trim window.
+        audio_ss = max(0.0, audio_ss - 0.15)
         duration  = (clip_to - audio_ss) if clip_to is not None else None
         cmd = ["ffplay", "-nodisp", "-autoexit", "-ss", str(audio_ss)]
         if duration is not None:
@@ -1795,12 +1798,16 @@ class SprayApp:
                     os.kill(pid, _sig.SIGRTMIN + 1)
                 except Exception:
                     pass
-            time.sleep(0.25)
-            try:
-                subprocess.run(["pkill", "-f", "gsr-notify"], capture_output=True)
-            except Exception:
-                pass
             self.root.after(0, lambda: self.status_var.set("Saving clip…"))
+            # Kill gsr-notify in a loop for 2 s to catch late-spawning instances
+            def _suppress_notify():
+                for _ in range(20):
+                    time.sleep(0.1)
+                    try:
+                        subprocess.run(["pkill", "-f", "gsr-notify"], capture_output=True)
+                    except Exception:
+                        pass
+            threading.Thread(target=_suppress_notify, daemon=True).start()
             self._clip_worker(spray, replay_dir, before, sig_time)
 
         threading.Thread(target=_delayed_save, daemon=True).start()
