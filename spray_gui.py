@@ -452,29 +452,30 @@ class SprayApp:
         replay_dir, pids = self._find_gsr_replay_dir()
         if not replay_dir or not pids:
             return
-        # Snapshot before signal so we don't miss a fast save
         before = set(glob.glob(os.path.join(replay_dir, "*.mp4")))
-        sig_time = time.time()
-        for pid in pids:
-            try:
-                os.kill(pid, _sig.SIGRTMIN + 1)
-            except Exception:
-                pass
-        # Kill gsr-notify quickly so the HUD doesn't flash on screen
-        def _suppress_notify():
+        self.status_var.set("Clip in 1.5 s…")
+
+        def _delayed_save():
+            # Wait so GSR captures ~1.5 s of post-spray footage before we
+            # trigger the save.  Without this delay the clip ends the instant
+            # the spray does.
+            time.sleep(1.5)
+            sig_time = time.time()
+            for pid in pids:
+                try:
+                    os.kill(pid, _sig.SIGRTMIN + 1)
+                except Exception:
+                    pass
             time.sleep(0.25)
             try:
                 subprocess.run(["pkill", "-f", "gsr-notify"],
                                capture_output=True)
             except Exception:
                 pass
-        threading.Thread(target=_suppress_notify, daemon=True).start()
-        self.status_var.set("Saving clip…")
-        threading.Thread(
-            target=self._clip_worker,
-            args=(spray, replay_dir, before, sig_time),
-            daemon=True,
-        ).start()
+            self.root.after(0, lambda: self.status_var.set("Saving clip…"))
+            self._clip_worker(spray, replay_dir, before, sig_time)
+
+        threading.Thread(target=_delayed_save, daemon=True).start()
 
     def _clip_worker(self, spray, replay_dir, before, sig_time):
         import glob, shutil
@@ -569,7 +570,7 @@ class SprayApp:
         """
         clip_dur  = self._clip_duration
         spray_dur = max(0.1, self._clip_spray_dur)
-        poll_lag  = 0.5          # max seconds between spray-end and signal
+        poll_lag  = 2.0          # 1.5 s intentional delay + up to 0.5 s poll cycle
 
         spray_end   = clip_dur - poll_lag
         spray_start = spray_end - spray_dur
@@ -591,6 +592,7 @@ class SprayApp:
         self._clip_ss = ss
         self._clip_to = to
         trimmed_dur = to - ss
+        self._clip_trimmed_dur = trimmed_dur   # used by _clip_tick for display
 
         def _fmt(s):
             s = max(0, int(s))
@@ -805,7 +807,8 @@ class SprayApp:
         def _fmt(s):
             s = max(0, int(s))
             return f"{s // 60}:{s % 60:02d}"
-        self._clip_time_var.set(f"{_fmt(pos)} / {_fmt(self._clip_duration)}")
+        total = getattr(self, "_clip_trimmed_dur", self._clip_duration)
+        self._clip_time_var.set(f"{_fmt(pos)} / {_fmt(total)}")
 
         interval = max(1, int(1000.0 / (self._clip_fps * self._clip_speed)))
         self._clip_tick_id = self.root.after(interval, self._clip_tick)
