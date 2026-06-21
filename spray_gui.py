@@ -155,6 +155,22 @@ def cumulative_xy(spray):
     return t, x, y
 
 
+def chain_cumulative_xy(sprays):
+    """Concatenate samples from multiple sprays end-to-end, continuing cumulative position."""
+    t_all, x_all, y_all = [], [], []
+    cx = cy = t_offset = 0.0
+    for i, spray in enumerate(sprays):
+        for s in spray["samples"]:
+            cx += s["dx"]
+            cy += s["dy"]
+            t_all.append(s["t"] + t_offset)
+            x_all.append(cx)
+            y_all.append(cy)
+        if i < len(sprays) - 1:
+            t_offset += spray.get("duration", 0) + 0.05
+    return t_all, x_all, y_all
+
+
 def load_sprays(directory):
     import glob
     files = sorted(glob.glob(os.path.join(directory, "spray_*.json")))
@@ -386,6 +402,13 @@ class SprayApp:
         self._clip_play_start_frame = 0      # frame number at last play/resume
         self._mouse_in_gui = False  # updated by _poll_hover every 50 ms
 
+        # Spray chaining state
+        self.chains = []             # list of lists of spray indices
+        self.spray_chain_id = {}     # spray_idx -> chain_idx
+        self.selected_chain = []     # spray indices of selected chain (for plot)
+        self._pending_clip_chain = []  # spray indices accumulating for debounced clip
+        self._pending_clip_timer = None  # root.after id for debounce
+
         root.title("CS2 Spray Tracker")
         root.configure(bg="#1e1e1e")
         self._build_ui()
@@ -445,39 +468,13 @@ class SprayApp:
         return n, mag
 
     def _maybe_save_clip(self, spray):
-        import glob, signal as _sig
+        """Single-spray gate check + save. Chain mode uses _schedule_clip instead."""
         n_shots, mag = self._bullet_count_estimate(spray)
         gate = getattr(self, "bullet_pct_var", None)
         threshold = (gate.get() / 100.0) if gate else 0.4
         if mag == 0 or n_shots < threshold * mag:
             return
-        replay_dir, pids = self._find_gsr_replay_dir()
-        if not replay_dir or not pids:
-            return
-        before = set(glob.glob(os.path.join(replay_dir, "*.mp4")))
-        buf_after = getattr(self, "clip_after_var", None)
-        delay_s = buf_after.get() if buf_after else 3.0
-        self.status_var.set(f"Clip in {delay_s:g} s…")
-
-        def _delayed_save():
-            buf_after = getattr(self, "clip_after_var", None)
-            time.sleep(buf_after.get() if buf_after else 3.0)
-            sig_time = time.time()
-            for pid in pids:
-                try:
-                    os.kill(pid, _sig.SIGRTMIN + 1)
-                except Exception:
-                    pass
-            time.sleep(0.25)
-            try:
-                subprocess.run(["pkill", "-f", "gsr-notify"],
-                               capture_output=True)
-            except Exception:
-                pass
-            self.root.after(0, lambda: self.status_var.set("Saving clip…"))
-            self._clip_worker(spray, replay_dir, before, sig_time)
-
-        threading.Thread(target=_delayed_save, daemon=True).start()
+        self._do_save_clip(spray)
 
     def _clip_worker(self, spray, replay_dir, before, sig_time):
         import glob, shutil
@@ -640,9 +637,9 @@ class SprayApp:
             if not hasattr(self, "_clip_decode_started") or not self._clip_decode_started:
                 self._clip_start_decode()
             # Wall-clock reference: video and audio both anchored to this moment.
-            # +0.15 s offsets the video slightly so ffplay has time to start before
-            # the first frame appears, keeping them in sync from the first frame.
-            self._clip_play_start_wall  = time.monotonic() + 0.15
+            # +0.3 s gives ffplay ~300 ms to start; audio seeks 0.15 s earlier in
+            # the file so audio position at t=0.3 matches video frame 0.
+            self._clip_play_start_wall  = time.monotonic() + 0.3
             self._clip_play_start_frame = self._clip_frame_num
             self._clip_audio_start(self._clip_frame_num)
             self._clip_tick()
@@ -816,7 +813,7 @@ class SprayApp:
                         pass
                 self._clip_ffmpeg = None
                 self._clip_frame_num     = 0
-                self._clip_play_start_wall  = time.monotonic() + 0.15
+                self._clip_play_start_wall  = time.monotonic() + 0.3
                 self._clip_play_start_frame = 0
                 self._clip_decode_started = False
                 self._clip_start_decode()
@@ -891,8 +888,14 @@ class SprayApp:
             self._clip_play_btn.config(state="disabled", text="▶  No clip")
             self._clip_set_label("no clip for this spray")
             return
-        idx = max(0, min(self.selected_idx, len(self.sprays) - 1))
-        clip_name = self.sprays[idx].get("clip", "")
+        # Find clip across all sprays in the selected chain
+        chain = [i for i in getattr(self, "selected_chain", []) if i < len(self.sprays)]
+        if not chain:
+            idx = max(0, min(self.selected_idx, len(self.sprays) - 1))
+            chain = [idx]
+        clip_name = next(
+            (self.sprays[i].get("clip", "") for i in chain if self.sprays[i].get("clip")),
+            "")
         has_clip = bool(clip_name)
         self._clip_play_btn.config(
             state="normal" if has_clip else "disabled",
@@ -901,7 +904,8 @@ class SprayApp:
         if has_clip:
             clip_path = os.path.join(self.out_dir, "clips", clip_name)
             if os.path.exists(clip_path) and clip_path != self._current_clip_path:
-                spray_dur = self.sprays[idx].get("duration", 0)
+                # Combined duration covers the whole chain for trim calculation
+                spray_dur = sum(self.sprays[i].get("duration", 0) for i in chain)
                 self._clip_load(clip_path, spray_duration=spray_dur)
         else:
             self._clip_stop()
@@ -1075,7 +1079,19 @@ class SprayApp:
         self.clip_after_label = tk.Label(lf2, text="clip: 3.0 s after spray",
                                          bg="#1e1e1e", fg="#555555",
                                          font=("monospace", 8))
-        self.clip_after_label.grid(row=11, column=0, pady=(0, 5))
+        self.clip_after_label.grid(row=11, column=0, pady=(0, 2))
+
+        self.chain_gap_var = tk.DoubleVar(value=1.0)
+        tk.Scale(lf2, variable=self.chain_gap_var, from_=0, to=5, resolution=0.5,
+                 orient=tk.HORIZONTAL, bg="#1e1e1e", fg="#d4d4d4",
+                 troughcolor="#3c3c3c", highlightbackground="#1e1e1e",
+                 showvalue=False, length=190,
+                 command=lambda _: self._on_chain_gap_change()).grid(
+            row=12, column=0, padx=4, pady=2)
+        self.chain_gap_label = tk.Label(lf2, text="chain gap: 1.0 s (links nearby sprays)",
+                                        bg="#1e1e1e", fg="#555555",
+                                        font=("monospace", 8))
+        self.chain_gap_label.grid(row=13, column=0, pady=(0, 5))
 
         # --- Weapon ---
         lf3 = ttk.LabelFrame(parent, text="Weapon")
@@ -1374,6 +1390,10 @@ class SprayApp:
             v = float(s["clip_after_s"])
             self.clip_after_var.set(v)
             self.clip_after_label.config(text=f"clip: {v:g} s after spray")
+        if "chain_gap_s" in s:
+            v = float(s["chain_gap_s"])
+            self.chain_gap_var.set(v)
+            self.chain_gap_label.config(text=f"chain gap: {v:g} s (links nearby sprays)")
         # Device (override CLI --device only if no device was passed on the CLI)
         if not self.current_device and s.get("device"):
             saved = s["device"]
@@ -1403,6 +1423,7 @@ class SprayApp:
             "clip_bullet_pct":  self.bullet_pct_var.get(),
             "clip_before_s":    self.clip_before_var.get(),
             "clip_after_s":     self.clip_after_var.get(),
+            "chain_gap_s":      self.chain_gap_var.get(),
         }
         try:
             with open(self._settings_path, "w") as f:
@@ -1498,7 +1519,7 @@ class SprayApp:
             self._live_override = None
             self._live_prev_count = 0
             self._live_pattern_cache = None
-            new_sprays = []
+            new_indices = []
             for f in new_files:
                 try:
                     with open(f) as fh:
@@ -1506,30 +1527,43 @@ class SprayApp:
                     data["_file"] = os.path.basename(f)
                     if data.get("samples"):
                         self.sprays.append(data)
-                        self._add_history_row(len(self.sprays) - 1, data)
-                        new_sprays.append(data)
+                        new_indices.append(len(self.sprays) - 1)
                 except Exception:
                     pass
-            self.selected_idx = len(self.sprays) - 1
-            self._sync_history_selection()
-            self._refresh_plot()
-            self._update_clip_btn()
-            # Trigger auto-clip for qualifying new sprays
-            if self.clip_auto_var.get():
-                for sp in new_sprays:
-                    self._maybe_save_clip(sp)
+            if new_indices:
+                self._compute_chains()
+                self._rebuild_history()
+                last_idx = new_indices[-1]
+                self.selected_idx = last_idx
+                ci = self.spray_chain_id.get(last_idx)
+                if ci is not None and ci < len(self.chains):
+                    self.selected_chain = list(self.chains[ci])
+                else:
+                    self.selected_chain = [last_idx]
+                self._sync_history_selection()
+                self._refresh_plot()
+                self._update_clip_btn()
+                # Debounced clip trigger: accumulates chain, fires once after chain_gap ms
+                if self.clip_auto_var.get():
+                    for idx in new_indices:
+                        self._schedule_clip(idx)
 
         # Drain clip notify queue — update history rows when clips land
         while not self._clip_notify_queue.empty():
             fname = self._clip_notify_queue.get_nowait()
             for i, sp in enumerate(self.sprays):
                 if sp.get("_file") == fname:
-                    iid = str(i)
-                    if self.history_tree.exists(iid):
-                        vals = list(self.history_tree.item(iid, "values"))
-                        if not vals[0].startswith("▶"):
+                    # The chain row iid is the last spray index in i's chain
+                    ci = self.spray_chain_id.get(i)
+                    if ci is not None and ci < len(self.chains):
+                        row_iid = str(self.chains[ci][-1])
+                    else:
+                        row_iid = str(i)
+                    if self.history_tree.exists(row_iid):
+                        vals = list(self.history_tree.item(row_iid, "values"))
+                        if "▶" not in vals[0]:
                             vals[0] = "▶" + vals[0]
-                        self.history_tree.item(iid, values=tuple(vals))
+                        self.history_tree.item(row_iid, values=tuple(vals))
                     break
             self._update_clip_btn()
 
@@ -1611,12 +1645,16 @@ class SprayApp:
 
     def _load_existing_sprays(self):
         self.sprays = load_sprays(self.out_dir)
-        self.history_tree.delete(*self.history_tree.get_children())
-        start = max(0, len(self.sprays) - self.MAX_HISTORY)
-        for i, sp in enumerate(self.sprays[start:], start=start):
-            self._add_history_row(i, sp)
+        self._compute_chains()
+        self._rebuild_history()
         if self.sprays:
-            self.selected_idx = len(self.sprays) - 1
+            last_idx = len(self.sprays) - 1
+            self.selected_idx = last_idx
+            ci = self.spray_chain_id.get(last_idx)
+            if ci is not None and ci < len(self.chains):
+                self.selected_chain = list(self.chains[ci])
+            else:
+                self.selected_chain = [last_idx]
             self._sync_history_selection()
             self._refresh_plot()
 
@@ -1639,6 +1677,134 @@ class SprayApp:
                                  values=(wep, f"{dur_ms}", f"{smp}", f"{ny:+d}"))
         self.history_tree.see(iid)
 
+    def _compute_chains(self):
+        """Group sprays into chains where consecutive gap ≤ chain_gap_var."""
+        if not self.sprays:
+            self.chains = []
+            self.spray_chain_id = {}
+            return
+        gap_var = getattr(self, "chain_gap_var", None)
+        threshold = gap_var.get() if gap_var else 1.0
+        chains = []
+        current = [0]
+        for i in range(1, len(self.sprays)):
+            prev = self.sprays[i - 1]
+            curr = self.sprays[i]
+            prev_end = prev.get("start_time", 0) + prev.get("duration", 0)
+            curr_start = curr.get("start_time", 0)
+            gap = curr_start - prev_end
+            if 0 <= gap <= threshold:
+                current.append(i)
+            else:
+                chains.append(current)
+                current = [i]
+        chains.append(current)
+        self.chains = chains
+        self.spray_chain_id = {}
+        for ci, chain in enumerate(chains):
+            for si in chain:
+                self.spray_chain_id[si] = ci
+
+    def _add_chain_row(self, chain_idx):
+        """Insert one treeview row for a chain. iid = str(last spray index)."""
+        chain = self.chains[chain_idx]
+        last_idx = chain[-1]
+        iid = str(last_idx)
+        if self.history_tree.exists(iid):
+            return
+        chain_sprays = [self.sprays[i] for i in chain if i < len(self.sprays)]
+        total_dur_ms = int(sum(sp.get("duration", 0) for sp in chain_sprays) * 1000)
+        total_smp = sum(sp.get("n_samples", 0) for sp in chain_sprays)
+        total_ny = sum(sp.get("net_dy", 0) for sp in chain_sprays)
+        last_sp = chain_sprays[-1]
+        wep = self._WEP_ABBREV.get(last_sp.get("weapon", ""), last_sp.get("weapon", "")[:6])
+        if any(sp.get("clip") for sp in chain_sprays):
+            wep = "▶" + wep
+        if len(chain) > 1:
+            wep = f"⛓{len(chain)} " + wep
+        self.history_tree.insert("", "end", iid=iid,
+                                 values=(wep, f"{total_dur_ms}", f"{total_smp}", f"{int(total_ny):+d}"))
+        self.history_tree.see(iid)
+
+    def _rebuild_history(self):
+        """Rebuild the treeview from scratch with one row per chain."""
+        self.history_tree.delete(*self.history_tree.get_children())
+        start = max(0, len(self.chains) - self.MAX_HISTORY)
+        for ci in range(start, len(self.chains)):
+            self._add_chain_row(ci)
+        if self.selected_idx >= 0:
+            self._sync_history_selection()
+
+    def _schedule_clip(self, spray_idx):
+        """Debounce clip trigger: wait chain_gap ms after last new spray, then fire once."""
+        if self._pending_clip_timer is not None:
+            self.root.after_cancel(self._pending_clip_timer)
+        self._pending_clip_chain.append(spray_idx)
+        gap_var = getattr(self, "chain_gap_var", None)
+        gap_ms = int((gap_var.get() if gap_var else 1.0) * 1000) + 200
+        self._pending_clip_timer = self.root.after(gap_ms, self._fire_clip_chain)
+
+    def _fire_clip_chain(self):
+        """Fire the clip save for the accumulated chain of sprays."""
+        self._pending_clip_timer = None
+        chain_indices = list(self._pending_clip_chain)
+        self._pending_clip_chain.clear()
+        if not chain_indices or not self.clip_auto_var.get():
+            return
+        # Sum bullets across all sprays (uncapped per spray so full-chain count is used)
+        total_shots = 0.0
+        total_mag = 0
+        combined_dur = 0.0
+        for idx in chain_indices:
+            if idx >= len(self.sprays):
+                continue
+            sp = self.sprays[idx]
+            wdata = WEAPON_DATA.get(sp.get("weapon", "None"))
+            if wdata:
+                total_shots += sp.get("duration", 0) * wdata["rpm"] / 60
+                total_mag = max(total_mag, wdata["mag"])
+            combined_dur += sp.get("duration", 0)
+        gate = getattr(self, "bullet_pct_var", None)
+        threshold = (gate.get() / 100.0) if gate else 0.4
+        if total_mag == 0 or total_shots < threshold * total_mag:
+            return
+        last_idx = chain_indices[-1]
+        if last_idx >= len(self.sprays):
+            return
+        combined_spray = dict(self.sprays[last_idx])
+        combined_spray["duration"] = combined_dur
+        self._do_save_clip(combined_spray)
+
+    def _do_save_clip(self, spray):
+        """Trigger GSR replay save after the configured delay. No bullet gate check here."""
+        import glob, signal as _sig
+        replay_dir, pids = self._find_gsr_replay_dir()
+        if not replay_dir or not pids:
+            return
+        before = set(glob.glob(os.path.join(replay_dir, "*.mp4")))
+        buf_after = getattr(self, "clip_after_var", None)
+        delay_s = buf_after.get() if buf_after else 3.0
+        self.status_var.set(f"Clip in {delay_s:g} s…")
+
+        def _delayed_save():
+            buf_after = getattr(self, "clip_after_var", None)
+            time.sleep(buf_after.get() if buf_after else 3.0)
+            sig_time = time.time()
+            for pid in pids:
+                try:
+                    os.kill(pid, _sig.SIGRTMIN + 1)
+                except Exception:
+                    pass
+            time.sleep(0.25)
+            try:
+                subprocess.run(["pkill", "-f", "gsr-notify"], capture_output=True)
+            except Exception:
+                pass
+            self.root.after(0, lambda: self.status_var.set("Saving clip…"))
+            self._clip_worker(spray, replay_dir, before, sig_time)
+
+        threading.Thread(target=_delayed_save, daemon=True).start()
+
     def _sync_history_selection(self):
         iid = str(self.selected_idx)
         if self.history_tree.exists(iid):
@@ -1650,7 +1816,13 @@ class SprayApp:
         if sel:
             if self._replay_active:
                 self._stop_replay()
-            self.selected_idx = int(sel[0])
+            last_spray_idx = int(sel[0])
+            ci = self.spray_chain_id.get(last_spray_idx)
+            if ci is not None and ci < len(self.chains):
+                self.selected_chain = list(self.chains[ci])
+            else:
+                self.selected_chain = [last_spray_idx]
+            self.selected_idx = last_spray_idx
             spray = self.sprays[self.selected_idx]
             wep = spray.get("weapon", "None") or "None"
             if wep in WEAPON_DATA:
@@ -1759,6 +1931,15 @@ class SprayApp:
         after  = self.clip_after_var.get()
         self.clip_before_label.config(text=f"clip: {before:g} s before spray")
         self.clip_after_label.config(text=f"clip: {after:g} s after spray")
+        self._save_settings()
+
+    def _on_chain_gap_change(self):
+        gap = self.chain_gap_var.get()
+        self.chain_gap_label.config(text=f"chain gap: {gap:g} s (links nearby sprays)")
+        self._compute_chains()
+        self._rebuild_history()
+        if self.sprays:
+            self._refresh_plot()
         self._save_settings()
 
     def _on_detrend_toggle(self):
@@ -2063,6 +2244,16 @@ class SprayApp:
         idx = max(0, min(self.selected_idx, len(sprays) - 1))
         sel = sprays[idx]
 
+        # Resolve chain: collect all sprays to plot together
+        chain_indices = [i for i in getattr(self, "selected_chain", [idx])
+                         if i < len(sprays)]
+        if not chain_indices:
+            chain_indices = [idx]
+        chain_sprays = [sprays[i] for i in chain_indices]
+        combined_dur = sum(sp.get("duration", 0) for sp in chain_sprays)
+        combined_smp = sum(sp.get("n_samples", 0) for sp in chain_sprays)
+        is_chain = len(chain_sprays) > 1
+
         weapon_name = self.weapon_var.get()
         wdata = WEAPON_DATA.get(weapon_name)
         sensitivity = self.sens_var.get()
@@ -2082,7 +2273,10 @@ class SprayApp:
             for spine in ax.spines.values():
                 spine.set_edgecolor("#3c3c3c")
 
-        t, x, y = cumulative_xy(sel)
+        if is_chain:
+            t, x, y = chain_cumulative_xy(chain_sprays)
+        else:
+            t, x, y = cumulative_xy(sel)
         if do_detrend:
             x, y = self._detrend(t, x, y)
 
@@ -2090,9 +2284,10 @@ class SprayApp:
         fire_t, fire_x, fire_y = self._bullet_positions(t, x, y, wdata)
         n_shots = len(fire_t)
 
+        title_prefix = (f"⛓{len(chain_sprays)}-spray chain" if is_chain
+                        else sel["_file"])
         fig.suptitle(
-            f"{sel['_file']}   {sel.get('duration', 0)*1000:.0f} ms   "
-            f"{sel.get('n_samples', 0)} samples"
+            f"{title_prefix}   {combined_dur*1000:.0f} ms   {combined_smp} samples"
             + (f"   |   {weapon_name}  sens {sensitivity:.1f}"
                + (f"   —  {n_shots} shots" if n_shots else "")
                if wdata else "")
@@ -2107,7 +2302,7 @@ class SprayApp:
 
         if vfocus:
             it, ix, iy = pattern_to_counts(wdata, sensitivity, m_yaw,
-                                           max_duration=sel.get("duration"))
+                                           max_duration=combined_dur)
             t_arr = np.array(t)
             ix_arr = np.array(ix); iy_arr = np.array(iy); it_arr = np.array(it)
             x_dev = (np.array(x) - np.interp(t_arr, it_arr, ix_arr)).tolist()
@@ -2166,7 +2361,7 @@ class SprayApp:
 
             if wdata:
                 it, ix, iy = pattern_to_counts(wdata, sensitivity, m_yaw,
-                                               max_duration=sel.get("duration"))
+                                               max_duration=combined_dur)
                 ax_traj.plot(ix, iy, "--", color=wdata["color"], lw=1.5, zorder=4,
                              alpha=0.7, label=f"ideal {weapon_name}")
                 ax_traj.scatter(ix, iy, color=wdata["color"], s=22, zorder=6,

@@ -135,9 +135,11 @@ A new entry appears in the history list automatically.
 
 **Clip before / after sliders** (0–10 s): how many seconds of footage to include before the first bullet and after the last bullet. Both default to 3 s. The "after" value also sets the delay before the GSR save is triggered, ensuring the buffer actually contains that much post-spray footage.
 
+**Chain gap slider** (0–5 s, default 1 s): if two consecutive sprays are separated by less than this gap, they are linked into a **spray chain**. The history shows the chain as one row (⛓N prefix for N sprays), the trajectory concatenates all sprays end-to-end, and the clip gate checks combined bullet count across the whole chain — one clip is saved for the full chain. Set to 0 s to disable chaining.
+
 ### Spray history
 
-Table of all recorded sprays (most recent at top). Click any row to load it into the plots and the clip player. Columns: weapon, duration (ms), sample count, net-Y (total vertical pull in mouse counts).
+Table of recorded sprays (one row per chain if chaining is enabled, or one per spray if the gap slider is 0). Click any row to load it into the plots and the clip player. Columns: weapon, duration (ms), sample count, net-Y (total vertical pull in mouse counts). A ⛓N prefix indicates a chain of N sprays; a ▶ prefix means a clip is saved.
 
 **Play clip** button (below the table) appears when the selected spray has a saved clip.
 
