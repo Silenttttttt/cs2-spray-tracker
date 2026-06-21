@@ -634,6 +634,30 @@ class SprayApp:
             self._clip_paused = True
             self._clip_pp_var.set("▶")
 
+    def _clip_toggle_fullscreen(self):
+        self._clip_fullscreen = not self._clip_fullscreen
+        was_playing = not self._clip_paused
+        # Pause during resize to avoid stale-frame-size decode
+        if was_playing:
+            self._clip_paused = True
+            self._clip_pp_var.set("▶")
+        self._clip_stop()
+
+        if self._clip_fullscreen:
+            self._clip_container.place(relx=0, rely=0, anchor="nw",
+                                       relwidth=1.0, relheight=1.0)
+            self._clip_fs_var.set("⤡")
+        else:
+            self._clip_container.place(relx=1.0, rely=1.0, anchor="se",
+                                       relwidth=0.375, relheight=0.46)
+            self._clip_fs_var.set("⤢")
+
+        # Reload at new dimensions after layout settles
+        if self._current_clip_path:
+            spray_dur = getattr(self, "_clip_spray_dur", 0)
+            self.root.after(80, lambda: self._clip_load(
+                self._current_clip_path, spray_duration=spray_dur))
+
     def _clip_start_decode(self):
         self._clip_decode_started = True
         self._clip_stop_evt.clear()
@@ -1111,19 +1135,21 @@ class SprayApp:
         tk  = self.tk
         ttk = self.ttk
 
-        clip_container = tk.Frame(canvas_tk, bg="#1e1e1e", bd=1, relief=tk.SUNKEN)
-        clip_container.place(relx=1.0, rely=1.0, anchor="se",
-                             relwidth=0.375, relheight=0.46)
+        self._clip_container = tk.Frame(canvas_tk, bg="#1e1e1e", bd=1, relief=tk.SUNKEN)
+        self._clip_container.place(relx=1.0, rely=1.0, anchor="se",
+                                   relwidth=0.375, relheight=0.46)
+        self._clip_fullscreen = False
+        self._canvas_tk = canvas_tk   # needed for fullscreen toggle
 
         # Video display area — shows PIL frames or "no clip" text
-        self._clip_vid_label = tk.Label(clip_container, bg="black",
+        self._clip_vid_label = tk.Label(self._clip_container, bg="black",
                                         text="no clip for this spray",
                                         fg="#333333", font=("monospace", 8),
                                         anchor="center")
         self._clip_vid_label.pack(fill=tk.BOTH, expand=True)
 
         # Controls bar
-        ctrl = tk.Frame(clip_container, bg="#252526")
+        ctrl = tk.Frame(self._clip_container, bg="#252526")
         ctrl.pack(fill=tk.X, side=tk.BOTTOM)
 
         row1 = tk.Frame(ctrl, bg="#252526")
@@ -1136,6 +1162,10 @@ class SprayApp:
         self._clip_time_var = tk.StringVar(value="0:00 / 0:00")
         tk.Label(row1, textvariable=self._clip_time_var, bg="#252526",
                  fg="#9d9d9d", font=("monospace", 8)).pack(side=tk.LEFT)
+
+        self._clip_fs_var = tk.StringVar(value="⤢")
+        ttk.Button(row1, textvariable=self._clip_fs_var, width=3,
+                   command=self._clip_toggle_fullscreen).pack(side=tk.RIGHT)
 
         row2 = tk.Frame(ctrl, bg="#252526")
         row2.pack(fill=tk.X, padx=4, pady=(1, 3))
