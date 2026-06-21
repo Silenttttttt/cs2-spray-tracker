@@ -380,6 +380,8 @@ class SprayApp:
         self._clip_vid_w     = 1
         self._clip_vid_h     = 1
         self._current_clip_path = None
+        self._clip_muted       = True   # audio off by default
+        self._clip_audio_proc  = None   # ffplay subprocess for audio
         self._mouse_in_gui = False  # updated by _poll_hover every 50 ms
 
         root.title("CS2 Spray Tracker")
@@ -629,10 +631,12 @@ class SprayApp:
             self._clip_pp_var.set("⏸")
             if not hasattr(self, "_clip_decode_started") or not self._clip_decode_started:
                 self._clip_start_decode()
+            self._clip_audio_start()
             self._clip_tick()
         else:
             self._clip_paused = True
             self._clip_pp_var.set("▶")
+            self._clip_audio_stop()
 
     def _clip_toggle_fullscreen(self):
         self._clip_fullscreen = not self._clip_fullscreen
@@ -663,6 +667,36 @@ class SprayApp:
             self.root.after(80, lambda: self._clip_load(
                 self._current_clip_path, spray_duration=spray_dur))
 
+    def _clip_toggle_mute(self):
+        self._clip_muted = not self._clip_muted
+        self._clip_mute_var.set("🔇" if self._clip_muted else "🔊")
+        if self._clip_muted:
+            self._clip_audio_stop()
+        elif not self._clip_paused:
+            self._clip_audio_start()
+
+    def _clip_audio_start(self):
+        self._clip_audio_stop()
+        path = self._current_clip_path
+        if not path or self._clip_muted:
+            return
+        ss = getattr(self, "_clip_ss", 0.0)
+        to = getattr(self, "_clip_to", None)
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-ss", str(ss)]
+        if to is not None:
+            cmd += ["-t", str(to - ss)]
+        cmd += [path]
+        self._clip_audio_proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _clip_audio_stop(self):
+        if self._clip_audio_proc:
+            try:
+                self._clip_audio_proc.kill()
+            except Exception:
+                pass
+            self._clip_audio_proc = None
+
     def _clip_save_trimmed(self):
         path = self._current_clip_path
         if not path or not os.path.exists(path):
@@ -674,10 +708,10 @@ class SprayApp:
         self.status_var.set("Exporting trimmed clip…")
 
         def _export():
-            cmd = ["ffmpeg", "-y", "-ss", str(ss)]
+            cmd = ["ffmpeg", "-y", "-ss", str(ss), "-i", path]
             if to is not None:
-                cmd += ["-to", str(to)]
-            cmd += ["-i", path, "-c", "copy", out_path]
+                cmd += ["-t", str(to - ss)]
+            cmd += ["-c", "copy", out_path]
             try:
                 subprocess.run(cmd, capture_output=True, check=True)
                 self.root.after(0, lambda: self.status_var.set(
@@ -702,11 +736,10 @@ class SprayApp:
 
         ss = getattr(self, "_clip_ss", 0.0)
         to = getattr(self, "_clip_to", None)
-        cmd = ["ffmpeg", "-ss", str(ss)]
+        cmd = ["ffmpeg", "-ss", str(ss), "-i", path]
         if to is not None:
-            cmd += ["-to", str(to)]
-        cmd += ["-i", path,
-                "-vf", f"scale={w}:{h}",
+            cmd += ["-t", str(to - ss)]   # duration, not end-time — unambiguous across ffmpeg versions
+        cmd += ["-vf", f"scale={w}:{h}",
                 "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
         self._clip_ffmpeg = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -757,6 +790,7 @@ class SprayApp:
             self._clip_frame_num = 0
             self._clip_decode_started = False
             self._clip_start_decode()
+            self._clip_audio_start()
             self._clip_tick_id = self.root.after(16, self._clip_tick)
             return
 
@@ -807,6 +841,7 @@ class SprayApp:
         self._clip_frame_num = 0
         self._clip_decode_started = False
         self._clip_pp_var.set("▶")
+        self._clip_audio_stop()
 
     def _on_close(self):
         self._clip_stop()
@@ -1195,6 +1230,10 @@ class SprayApp:
         self._clip_fs_var = tk.StringVar(value="⤢")
         ttk.Button(row1, textvariable=self._clip_fs_var, width=3,
                    command=self._clip_toggle_fullscreen).pack(side=tk.RIGHT)
+
+        self._clip_mute_var = tk.StringVar(value="🔇")
+        ttk.Button(row1, textvariable=self._clip_mute_var, width=3,
+                   command=self._clip_toggle_mute).pack(side=tk.RIGHT, padx=(0, 2))
 
         row2 = tk.Frame(ctrl, bg="#252526")
         row2.pack(fill=tk.X, padx=4, pady=(1, 3))
