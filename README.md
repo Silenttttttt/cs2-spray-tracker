@@ -2,9 +2,21 @@
 
 Record your own mouse movement during a spray (click-and-hold), compare it against the weapon's ideal recoil pattern, and optionally review it as a trimmed video clip — all inside one live GUI.
 
-It reads **raw mouse deltas** directly from the kernel (`/dev/input/event*` via `evdev`), bypassing the OS cursor. This matters: CS2 captures the cursor, so screen coordinates clamp at screen edges and are useless. Raw counts are exactly what you feed the game to fight recoil, and `evdev` sees them regardless of which window has focus.
+---
 
-This is purely a recorder of **your own input**. It does not read the game, inject input, or grab the device. The game still receives every event. It's the input equivalent of filming your own hand.
+## This is not a cheat
+
+**This tool does not interact with CS2 or any game in any way.**
+
+- It does not read game memory, network traffic, or any game state.
+- It does not inject input, synthesize mouse events, or control the mouse.
+- It does not modify game files, configs, or the game process.
+- It gives you zero in-game advantage. It cannot aim for you, reduce recoil for you, or do anything during a match.
+- It is not detectable by anti-cheat (VAC, FACEIT, etc.) because it does not touch the game at all.
+
+What it does is read the same raw motion events from your physical mouse that your OS reads anyway — the same numbers your hand is already producing. After you finish a spray and release the mouse button, it draws a graph of the path your hand took. That's the entire interaction with anything game-related.
+
+It is a **practice journal for your hand**, not a tool for your game client. The equivalent of filming yourself at a shooting range and watching the footage back — something you do off the range, with no effect on the next shot.
 
 ---
 
