@@ -509,7 +509,13 @@ class SprayApp:
         except Exception:
             pass
         spray["clip"] = clip_name
-        self._clip_notify_queue.put(spray["_file"])
+        # Update the live in-memory spray object (spray may be a copy from _fire_clip_chain)
+        fname = spray.get("_file", "")
+        for sp in self.sprays:
+            if sp.get("_file") == fname:
+                sp["clip"] = clip_name
+                break
+        self._clip_notify_queue.put(fname)
 
     # ------------------------------------------------------------------
     # Clip player (PIL + ffmpeg pipe)
