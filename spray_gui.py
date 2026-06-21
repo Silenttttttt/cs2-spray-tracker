@@ -453,13 +453,11 @@ class SprayApp:
         if not replay_dir or not pids:
             return
         before = set(glob.glob(os.path.join(replay_dir, "*.mp4")))
-        self.status_var.set("Clip in 1.5 s…")
+        self.status_var.set("Clip in 3 s…")
 
         def _delayed_save():
-            # Wait so GSR captures ~1.5 s of post-spray footage before we
-            # trigger the save.  Without this delay the clip ends the instant
-            # the spray does.
-            time.sleep(1.5)
+            # Wait so GSR captures 3 s of post-spray footage before saving.
+            time.sleep(3.0)
             sig_time = time.time()
             for pid in pids:
                 try:
@@ -570,12 +568,12 @@ class SprayApp:
         """
         clip_dur  = self._clip_duration
         spray_dur = max(0.1, self._clip_spray_dur)
-        poll_lag  = 2.0          # 1.5 s intentional delay + up to 0.5 s poll cycle
+        poll_lag  = 3.5          # 3.0 s intentional delay + up to 0.5 s poll cycle
 
         spray_end   = clip_dur - poll_lag
         spray_start = spray_end - spray_dur
-        ss = max(0.0, spray_start - 2.0)   # 2 s before spray
-        to = min(clip_dur, spray_end + 1.0) # 1 s after spray
+        ss = max(0.0, spray_start - 3.0)   # 3 s before spray
+        to = min(clip_dur, spray_end + 3.0) # 3 s after spray
         return ss, to
 
     def _clip_finish_load(self, clip_path):
