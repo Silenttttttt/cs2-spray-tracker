@@ -658,6 +658,30 @@ class SprayApp:
             self.root.after(80, lambda: self._clip_load(
                 self._current_clip_path, spray_duration=spray_dur))
 
+    def _clip_save_trimmed(self):
+        path = self._current_clip_path
+        if not path or not os.path.exists(path):
+            return
+        ss = getattr(self, "_clip_ss", 0.0)
+        to = getattr(self, "_clip_to", None)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        out_path = os.path.join(self.out_dir, "clips", f"{stem}_trimmed.mp4")
+        self.status_var.set("Exporting trimmed clip…")
+
+        def _export():
+            cmd = ["ffmpeg", "-y", "-ss", str(ss)]
+            if to is not None:
+                cmd += ["-to", str(to)]
+            cmd += ["-i", path, "-c", "copy", out_path]
+            try:
+                subprocess.run(cmd, capture_output=True, check=True)
+                self.root.after(0, lambda: self.status_var.set(
+                    f"Saved → clips/{stem}_trimmed.mp4"))
+            except subprocess.CalledProcessError:
+                self.root.after(0, lambda: self.status_var.set("Export failed"))
+
+        threading.Thread(target=_export, daemon=True).start()
+
     def _clip_start_decode(self):
         self._clip_decode_started = True
         self._clip_stop_evt.clear()
@@ -1179,6 +1203,9 @@ class SprayApp:
                            command=lambda s=spd: self._clip_set_speed(s))
             b.pack(side=tk.LEFT, padx=1)
             self._clip_spd_btns[spd] = b
+
+        ttk.Button(row2, text="💾", width=3,
+                   command=self._clip_save_trimmed).pack(side=tk.RIGHT)
 
     def _build_status_bar(self):
         tk = self.tk
