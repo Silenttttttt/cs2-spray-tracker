@@ -380,8 +380,10 @@ class SprayApp:
         self._clip_vid_w     = 1
         self._clip_vid_h     = 1
         self._current_clip_path = None
-        self._clip_muted       = True   # audio off by default
-        self._clip_audio_proc  = None   # ffplay subprocess for audio
+        self._clip_muted            = True   # audio off by default
+        self._clip_audio_proc       = None   # ffplay subprocess for audio
+        self._clip_play_start_wall  = 0.0    # wall-clock reference for sync
+        self._clip_play_start_frame = 0      # frame number at last play/resume
         self._mouse_in_gui = False  # updated by _poll_hover every 50 ms
 
         root.title("CS2 Spray Tracker")
@@ -637,7 +639,12 @@ class SprayApp:
             self._clip_pp_var.set("⏸")
             if not hasattr(self, "_clip_decode_started") or not self._clip_decode_started:
                 self._clip_start_decode()
-            self._clip_audio_start()
+            # Wall-clock reference: video and audio both anchored to this moment.
+            # +0.15 s offsets the video slightly so ffplay has time to start before
+            # the first frame appears, keeping them in sync from the first frame.
+            self._clip_play_start_wall  = time.monotonic() + 0.15
+            self._clip_play_start_frame = self._clip_frame_num
+            self._clip_audio_start(self._clip_frame_num)
             self._clip_tick()
         else:
             self._clip_paused = True
@@ -681,16 +688,22 @@ class SprayApp:
         elif not self._clip_paused:
             self._clip_audio_start()
 
-    def _clip_audio_start(self):
+    def _clip_audio_start(self, frame_offset=0):
+        """Start ffplay audio at the position matching frame_offset into the trim window."""
         self._clip_audio_stop()
         path = self._current_clip_path
         if not path or self._clip_muted:
             return
-        ss = getattr(self, "_clip_ss", 0.0)
-        to = getattr(self, "_clip_to", None)
-        cmd = ["ffplay", "-nodisp", "-autoexit", "-ss", str(ss)]
-        if to is not None:
-            cmd += ["-t", str(to - ss)]
+        clip_ss = getattr(self, "_clip_ss", 0.0)
+        clip_to = getattr(self, "_clip_to", None)
+        # Seek to the right position in the file
+        audio_ss = clip_ss + frame_offset / max(1.0, self._clip_fps)
+        # Compensate for ffplay startup latency (~150 ms) by starting slightly early
+        audio_ss = max(clip_ss, audio_ss - 0.15)
+        duration  = (clip_to - audio_ss) if clip_to is not None else None
+        cmd = ["ffplay", "-nodisp", "-autoexit", "-ss", str(audio_ss)]
+        if duration is not None:
+            cmd += ["-t", str(max(0.0, duration))]
         cmd += [path]
         self._clip_audio_proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -778,43 +791,60 @@ class SprayApp:
     def _clip_tick(self):
         if self._clip_paused:
             return
-        try:
-            item = self._frame_queue.get_nowait()
-        except Exception:
-            self._clip_tick_id = self.root.after(16, self._clip_tick)
-            return
 
-        if item is None:
-            # End of stream — loop
-            self._clip_stop_evt.set()
-            if self._clip_ffmpeg:
-                try:
-                    self._clip_ffmpeg.kill()
-                except Exception:
-                    pass
-            self._clip_ffmpeg = None
-            self._clip_frame_num = 0
-            self._clip_decode_started = False
-            self._clip_start_decode()
-            self._clip_audio_start()
-            self._clip_tick_id = self.root.after(16, self._clip_tick)
-            return
+        fps   = max(1.0, self._clip_fps)
+        speed = max(0.01, self._clip_speed)
 
-        from PIL import ImageTk as _ITk
-        photo = _ITk.PhotoImage(item)
-        self._clip_photo = photo
-        self._clip_vid_label.configure(image=photo, text="")
+        # How many frames should have been shown by now, based on wall clock.
+        elapsed      = max(0.0, time.monotonic() - self._clip_play_start_wall) * speed
+        target_frame = self._clip_play_start_frame + int(elapsed * fps)
 
-        self._clip_frame_num += 1
-        pos = self._clip_frame_num / max(1, self._clip_fps)
+        # Drain the queue until we reach the target frame (skip stale frames).
+        item = None
+        while self._clip_frame_num <= target_frame:
+            try:
+                candidate = self._frame_queue.get_nowait()
+            except Exception:
+                break   # queue not ready yet; show whatever we have and retry
+            if candidate is None:
+                # End of stream — loop back to the beginning
+                self._clip_stop_evt.set()
+                if self._clip_ffmpeg:
+                    try:
+                        self._clip_ffmpeg.kill()
+                    except Exception:
+                        pass
+                self._clip_ffmpeg = None
+                self._clip_frame_num     = 0
+                self._clip_play_start_wall  = time.monotonic() + 0.15
+                self._clip_play_start_frame = 0
+                self._clip_decode_started = False
+                self._clip_start_decode()
+                self._clip_audio_start()
+                self._clip_tick_id = self.root.after(16, self._clip_tick)
+                return
+            item = candidate
+            self._clip_frame_num += 1
+
+        if item is not None:
+            from PIL import ImageTk as _ITk
+            photo = _ITk.PhotoImage(item)
+            self._clip_photo = photo
+            self._clip_vid_label.configure(image=photo, text="")
+
+        pos   = self._clip_frame_num / fps
+        total = getattr(self, "_clip_trimmed_dur", self._clip_duration)
 
         def _fmt(s):
             s = max(0, int(s))
             return f"{s // 60}:{s % 60:02d}"
-        total = getattr(self, "_clip_trimmed_dur", self._clip_duration)
         self._clip_time_var.set(f"{_fmt(pos)} / {_fmt(total)}")
 
-        interval = max(1, int(1000.0 / (self._clip_fps * self._clip_speed)))
+        # Schedule the next tick to fire exactly when the next frame is due.
+        next_frame_wall = (self._clip_play_start_wall
+                           + (self._clip_frame_num - self._clip_play_start_frame + 1)
+                           / (fps * speed))
+        interval = max(1, int((next_frame_wall - time.monotonic()) * 1000))
         self._clip_tick_id = self.root.after(interval, self._clip_tick)
 
     def _clip_set_speed(self, s):
