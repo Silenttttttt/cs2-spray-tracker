@@ -400,7 +400,10 @@ class SprayApp:
         self._clip_audio_proc       = None   # ffplay subprocess for audio
         self._clip_play_start_wall  = 0.0    # wall-clock reference for sync
         self._clip_play_start_frame = 0      # frame number at last play/resume
-        self._mouse_in_gui = False  # updated by _poll_hover every 50 ms
+        self._mouse_in_gui  = False  # updated by _poll_hover every 50 ms
+        self._cs2_focused   = True   # assume CS2 until first xdotool check
+        self._xdotool_ok    = None   # None=untested, True=ok, False=missing
+        self._hover_tick    = 0      # throttle counter for active-window check
 
         # Spray chaining state
         self.chains = []             # list of lists of spray indices
@@ -1041,11 +1044,17 @@ class SprayApp:
                         command=self._on_live_toggle).grid(
             row=4, column=0, sticky="w", padx=8, pady=(0, 2))
 
+        self.cs2_only_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(lf2, text="CS2 only  (ignore clicks outside CS2)",
+                        variable=self.cs2_only_var,
+                        command=self._save_settings).grid(
+            row=5, column=0, sticky="w", padx=8, pady=(0, 2))
+
         self.clip_auto_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(lf2, text="Auto-clip  (via gsr)",
                         variable=self.clip_auto_var,
                         command=self._save_settings).grid(
-            row=5, column=0, sticky="w", padx=8, pady=(0, 2))
+            row=6, column=0, sticky="w", padx=8, pady=(0, 2))
 
         self.bullet_pct_var = tk.IntVar(value=40)
         tk.Scale(lf2, variable=self.bullet_pct_var, from_=0, to=100, resolution=5,
@@ -1053,11 +1062,11 @@ class SprayApp:
                  troughcolor="#3c3c3c", highlightbackground="#1e1e1e",
                  showvalue=False, length=190,
                  command=lambda _: self._on_bullet_pct_change()).grid(
-            row=6, column=0, padx=4, pady=2)
+            row=7, column=0, padx=4, pady=2)
         self.bullet_pct_label = tk.Label(lf2, text="clip gate: ≥40% bullets",
                                          bg="#1e1e1e", fg="#555555",
                                          font=("monospace", 8))
-        self.bullet_pct_label.grid(row=7, column=0, pady=(0, 2))
+        self.bullet_pct_label.grid(row=8, column=0, pady=(0, 2))
 
         self.clip_before_var = tk.DoubleVar(value=3.0)
         tk.Scale(lf2, variable=self.clip_before_var, from_=0, to=10, resolution=0.5,
@@ -1065,11 +1074,11 @@ class SprayApp:
                  troughcolor="#3c3c3c", highlightbackground="#1e1e1e",
                  showvalue=False, length=190,
                  command=lambda _: self._on_clip_buf_change()).grid(
-            row=8, column=0, padx=4, pady=2)
+            row=9, column=0, padx=4, pady=2)
         self.clip_before_label = tk.Label(lf2, text="clip: 3.0 s before spray",
                                           bg="#1e1e1e", fg="#555555",
                                           font=("monospace", 8))
-        self.clip_before_label.grid(row=9, column=0, pady=(0, 2))
+        self.clip_before_label.grid(row=10, column=0, pady=(0, 2))
 
         self.clip_after_var = tk.DoubleVar(value=3.0)
         tk.Scale(lf2, variable=self.clip_after_var, from_=0, to=10, resolution=0.5,
@@ -1077,11 +1086,11 @@ class SprayApp:
                  troughcolor="#3c3c3c", highlightbackground="#1e1e1e",
                  showvalue=False, length=190,
                  command=lambda _: self._on_clip_buf_change()).grid(
-            row=10, column=0, padx=4, pady=2)
+            row=11, column=0, padx=4, pady=2)
         self.clip_after_label = tk.Label(lf2, text="clip: 3.0 s after spray",
                                          bg="#1e1e1e", fg="#555555",
                                          font=("monospace", 8))
-        self.clip_after_label.grid(row=11, column=0, pady=(0, 2))
+        self.clip_after_label.grid(row=12, column=0, pady=(0, 2))
 
         self.chain_gap_var = tk.DoubleVar(value=1.0)
         tk.Scale(lf2, variable=self.chain_gap_var, from_=0, to=5, resolution=0.5,
@@ -1089,11 +1098,11 @@ class SprayApp:
                  troughcolor="#3c3c3c", highlightbackground="#1e1e1e",
                  showvalue=False, length=190,
                  command=lambda _: self._on_chain_gap_change()).grid(
-            row=12, column=0, padx=4, pady=2)
+            row=13, column=0, padx=4, pady=2)
         self.chain_gap_label = tk.Label(lf2, text="chain gap: 1.0 s (links nearby sprays)",
                                         bg="#1e1e1e", fg="#555555",
                                         font=("monospace", 8))
-        self.chain_gap_label.grid(row=13, column=0, pady=(0, 5))
+        self.chain_gap_label.grid(row=14, column=0, pady=(0, 5))
 
         # --- Weapon ---
         lf3 = ttk.LabelFrame(parent, text="Weapon")
@@ -1396,6 +1405,8 @@ class SprayApp:
             v = float(s["chain_gap_s"])
             self.chain_gap_var.set(v)
             self.chain_gap_label.config(text=f"chain gap: {v:g} s (links nearby sprays)")
+        if "cs2_only" in s:
+            self.cs2_only_var.set(bool(s["cs2_only"]))
         # Device (override CLI --device only if no device was passed on the CLI)
         if not self.current_device and s.get("device"):
             saved = s["device"]
@@ -1426,6 +1437,7 @@ class SprayApp:
             "clip_before_s":    self.clip_before_var.get(),
             "clip_after_s":     self.clip_after_var.get(),
             "chain_gap_s":      self.chain_gap_var.get(),
+            "cs2_only":         self.cs2_only_var.get(),
         }
         try:
             with open(self._settings_path, "w") as f:
@@ -1484,7 +1496,10 @@ class SprayApp:
                 return
             self.recorder = Recorder(path, self.out_dir, self.rec_queue,
                                      min_duration=self.min_hold_var.get() / 1000.0,
-                                     gui_hover_fn=lambda: self._mouse_in_gui)
+                                     gui_hover_fn=lambda: (
+                                         self._mouse_in_gui or
+                                         (self.cs2_only_var.get() and not self._cs2_focused)
+                                     ))
             self.recorder.weapon = self.weapon_var.get()
             self.recorder.start()
             self.rec_btn_text.set("■  Disarm recorder")
@@ -1499,7 +1514,7 @@ class SprayApp:
         self.root.after(self.POLL_MS, self._poll)
 
     def _poll_hover(self):
-        """Track whether the mouse cursor is inside our window every 50 ms."""
+        """Track mouse-in-GUI and CS2 active window every 50 ms (window check every 250 ms)."""
         try:
             px = self.root.winfo_pointerx()
             py = self.root.winfo_pointery()
@@ -1510,7 +1525,25 @@ class SprayApp:
             self._mouse_in_gui = (wx <= px <= wx + ww and wy <= py <= wy + wh)
         except Exception:
             pass
+        self._hover_tick = (self._hover_tick + 1) % 5
+        if self._hover_tick == 0 and self._xdotool_ok is not False:
+            self._check_cs2_window()
         self.root.after(50, self._poll_hover)
+
+    def _check_cs2_window(self):
+        """Update _cs2_focused using xdotool. Disables itself if xdotool is missing."""
+        try:
+            name = subprocess.check_output(
+                ["xdotool", "getactivewindow", "getwindowname"],
+                text=True, stderr=subprocess.DEVNULL, timeout=0.2,
+            ).strip().lower()
+            self._xdotool_ok = True
+            self._cs2_focused = "counter-strike" in name or name.startswith("cs2")
+        except FileNotFoundError:
+            self._xdotool_ok = False   # xdotool not installed; never try again
+            self._cs2_focused = True   # fall back: don't restrict recording
+        except Exception:
+            pass  # timeout or other transient error; keep previous value
 
     def _poll(self):
         new_files = []
