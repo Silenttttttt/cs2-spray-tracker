@@ -199,7 +199,7 @@ Key flags:
 
 | Flag | Meaning |
 |------|---------|
-| `-r 300` | keep a rolling 300-second replay buffer |
+| `-r 300` | keep a rolling 300-second replay buffer (you can change this, we only use about 15-20 seconds anyways) |
 | `-replay-storage ram` | store buffer in RAM (faster, no disk wear) |
 | `-o /path/` | where saved clips land (directory, not a filename) |
 | `-w screen` | capture entire screen (or use `-w DP-0` for a specific output) |
