@@ -489,6 +489,8 @@ class SprayApp:
                 new_file = max(candidates, key=os.path.getmtime)
                 break
         if not new_file:
+            # Timed out — clear the processing marker
+            self.root.after(0, lambda: self._mark_clip_row(spray.get("_file", ""), ""))
             return
         clips_dir = os.path.join(self.out_dir, "clips")
         os.makedirs(clips_dir, exist_ok=True)
@@ -642,10 +644,7 @@ class SprayApp:
             self._clip_pp_var.set("⏸")
             if not hasattr(self, "_clip_decode_started") or not self._clip_decode_started:
                 self._clip_start_decode()
-            # Wall-clock reference: video and audio both anchored to this moment.
-            # +0.3 s gives ffplay ~300 ms to start; audio seeks 0.15 s earlier in
-            # the file so audio position at t=0.3 matches video frame 0.
-            self._clip_play_start_wall  = time.monotonic() + 0.3
+            self._clip_play_start_wall  = time.monotonic()
             self._clip_play_start_frame = self._clip_frame_num
             self._clip_audio_start(self._clip_frame_num)
             self._clip_tick()
@@ -692,20 +691,14 @@ class SprayApp:
             self._clip_audio_start()
 
     def _clip_audio_start(self, frame_offset=0):
-        """Start ffplay audio at the position matching frame_offset into the trim window."""
+        """Start ffplay audio at the exact position matching the current video frame."""
         self._clip_audio_stop()
         path = self._current_clip_path
         if not path or self._clip_muted:
             return
         clip_ss = getattr(self, "_clip_ss", 0.0)
         clip_to = getattr(self, "_clip_to", None)
-        # Target position in the file for the current frame
         audio_ss = clip_ss + frame_offset / max(1.0, self._clip_fps)
-        # Seek 0.15 s BEFORE the target so audio is at the right position when
-        # video starts advancing (video is delayed +0.3 s, startup ≈ 0.15 s,
-        # net: audio position matches video position at t = play_start + 0.3 s).
-        # Clamp to 0.0 (not clip_ss) so we can seek before the trim window.
-        audio_ss = max(0.0, audio_ss - 0.15)
         duration  = (clip_to - audio_ss) if clip_to is not None else None
         cmd = ["ffplay", "-nodisp", "-autoexit", "-ss", str(audio_ss)]
         if duration is not None:
@@ -822,7 +815,7 @@ class SprayApp:
                         pass
                 self._clip_ffmpeg = None
                 self._clip_frame_num     = 0
-                self._clip_play_start_wall  = time.monotonic() + 0.3
+                self._clip_play_start_wall  = time.monotonic()
                 self._clip_play_start_frame = 0
                 self._clip_decode_started = False
                 self._clip_start_decode()
@@ -1560,20 +1553,7 @@ class SprayApp:
         # Drain clip notify queue — update history rows when clips land
         while not self._clip_notify_queue.empty():
             fname = self._clip_notify_queue.get_nowait()
-            for i, sp in enumerate(self.sprays):
-                if sp.get("_file") == fname:
-                    # The chain row iid is the last spray index in i's chain
-                    ci = self.spray_chain_id.get(i)
-                    if ci is not None and ci < len(self.chains):
-                        row_iid = str(self.chains[ci][-1])
-                    else:
-                        row_iid = str(i)
-                    if self.history_tree.exists(row_iid):
-                        vals = list(self.history_tree.item(row_iid, "values"))
-                        if "▶" not in vals[0]:
-                            vals[0] = "▶" + vals[0]
-                        self.history_tree.item(row_iid, values=tuple(vals))
-                    break
+            self._mark_clip_row(fname, "▶")
             self._update_clip_btn()
 
         # Update recording indicator
@@ -1794,6 +1774,8 @@ class SprayApp:
         buf_after = getattr(self, "clip_after_var", None)
         delay_s = buf_after.get() if buf_after else 3.0
         self.status_var.set(f"Clip in {delay_s:g} s…")
+        # Mark the history row as "saving in progress"
+        self._mark_clip_row(spray.get("_file", ""), "~")
 
         def _delayed_save():
             buf_after = getattr(self, "clip_after_var", None)
@@ -1817,6 +1799,22 @@ class SprayApp:
             self._clip_worker(spray, replay_dir, before, sig_time)
 
         threading.Thread(target=_delayed_save, daemon=True).start()
+
+    def _mark_clip_row(self, fname, prefix):
+        """Set the wep-column prefix for the history row that owns this spray file."""
+        for i, sp in enumerate(self.sprays):
+            if sp.get("_file") == fname:
+                ci = self.spray_chain_id.get(i)
+                row_iid = (str(self.chains[ci][-1])
+                           if ci is not None and ci < len(self.chains)
+                           else str(i))
+                if self.history_tree.exists(row_iid):
+                    vals = list(self.history_tree.item(row_iid, "values"))
+                    # Strip any existing prefix chars and re-apply
+                    wep = vals[0].lstrip("▶~")
+                    vals[0] = prefix + wep
+                    self.history_tree.item(row_iid, values=tuple(vals))
+                break
 
     def _sync_history_selection(self):
         iid = str(self.selected_idx)
