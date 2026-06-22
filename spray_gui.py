@@ -401,6 +401,7 @@ class SprayApp:
         self._clip_play_start_wall  = 0.0    # wall-clock reference for sync
         self._clip_play_start_frame = 0      # frame number at last play/resume
         self._mouse_in_gui  = False  # updated by _poll_hover every 50 ms
+        self._clip_processing = False  # True while waiting for GSR clip to land
         self._cs2_focused   = True   # assume CS2 until first xdotool check
         self._xdotool_ok    = None   # None=untested, True=ok, False=missing
         self._hover_tick    = 0      # throttle counter for active-window check
@@ -492,8 +493,11 @@ class SprayApp:
                 new_file = max(candidates, key=os.path.getmtime)
                 break
         if not new_file:
-            # Timed out — clear the processing marker
-            self.root.after(0, lambda: self._mark_clip_row(spray.get("_file", ""), ""))
+            def _clear():
+                self._clip_processing = False
+                self._mark_clip_row(spray.get("_file", ""), "")
+                self._update_clip_btn()
+            self.root.after(0, _clear)
             return
         clips_dir = os.path.join(self.out_dir, "clips")
         os.makedirs(clips_dir, exist_ok=True)
@@ -694,7 +698,7 @@ class SprayApp:
             self._clip_audio_start()
 
     def _clip_audio_start(self, frame_offset=0):
-        """Start ffplay audio at the exact position matching the current video frame."""
+        """Start audio via ffmpeg → pulse/alsa (no SDL, fast startup)."""
         self._clip_audio_stop()
         path = self._current_clip_path
         if not path or self._clip_muted:
@@ -703,12 +707,29 @@ class SprayApp:
         clip_to = getattr(self, "_clip_to", None)
         audio_ss = clip_ss + frame_offset / max(1.0, self._clip_fps)
         duration  = (clip_to - audio_ss) if clip_to is not None else None
-        cmd = ["ffplay", "-nodisp", "-autoexit", "-ss", str(audio_ss)]
+        cmd = ["ffmpeg", "-ss", str(audio_ss), "-i", path, "-vn"]
         if duration is not None:
             cmd += ["-t", str(max(0.0, duration))]
-        cmd += [path]
+        # Try PulseAudio/PipeWire first, fall back to ALSA
+        audio_sink = getattr(self, "_audio_sink", None)
+        if audio_sink is None:
+            audio_sink = self._detect_audio_sink()
+            self._audio_sink = audio_sink
+        cmd += ["-f", audio_sink, "default", "-loglevel", "quiet"]
         self._clip_audio_proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    @staticmethod
+    def _detect_audio_sink():
+        """Return 'pulse' or 'alsa' depending on what ffmpeg supports."""
+        try:
+            out = subprocess.check_output(
+                ["ffmpeg", "-formats"], stderr=subprocess.STDOUT, text=True, timeout=3)
+            if " pulse " in out:
+                return "pulse"
+        except Exception:
+            pass
+        return "alsa"
 
     def _clip_audio_stop(self):
         if self._clip_audio_proc:
@@ -902,20 +923,23 @@ class SprayApp:
             (self.sprays[i].get("clip", "") for i in chain if self.sprays[i].get("clip")),
             "")
         has_clip = bool(clip_name)
+        processing = self._clip_processing and not has_clip
         self._clip_play_btn.config(
             state="normal" if has_clip else "disabled",
-            text="▶  Play clip" if has_clip else "▶  No clip",
+            text="▶  Play clip" if has_clip else ("⏳ Saving…" if processing else "▶  No clip"),
         )
         if has_clip:
             clip_path = os.path.join(self.out_dir, "clips", clip_name)
             if os.path.exists(clip_path) and clip_path != self._current_clip_path:
-                # Combined duration covers the whole chain for trim calculation
                 spray_dur = sum(self.sprays[i].get("duration", 0) for i in chain)
                 self._clip_load(clip_path, spray_duration=spray_dur)
         else:
-            self._clip_stop()
-            self._clip_set_label("no clip for this spray")
-            self._current_clip_path = None
+            if not processing:
+                self._clip_stop()
+                self._clip_set_label("no clip for this spray")
+                self._current_clip_path = None
+            else:
+                self._clip_set_label("saving clip…")
 
     def _clip_set_label(self, text):
         if hasattr(self, "_clip_vid_label"):
@@ -1586,6 +1610,7 @@ class SprayApp:
         # Drain clip notify queue — update history rows when clips land
         while not self._clip_notify_queue.empty():
             fname = self._clip_notify_queue.get_nowait()
+            self._clip_processing = False
             self._mark_clip_row(fname, "▶")
             self._update_clip_btn()
 
@@ -1807,8 +1832,9 @@ class SprayApp:
         buf_after = getattr(self, "clip_after_var", None)
         delay_s = buf_after.get() if buf_after else 3.0
         self.status_var.set(f"Clip in {delay_s:g} s…")
-        # Mark the history row as "saving in progress"
+        self._clip_processing = True
         self._mark_clip_row(spray.get("_file", ""), "~")
+        self._update_clip_btn()
 
         def _delayed_save():
             buf_after = getattr(self, "clip_after_var", None)
